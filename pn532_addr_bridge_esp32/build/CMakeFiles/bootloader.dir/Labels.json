@@ -1,0 +1,43 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/Users/larsemmerich/Library/Mobile Documents/com~apple~CloudDocs/Dropbox_cloud/Projekte/Schwachsinn/hsd_lima_unlocker/pn532_addr_bridge_esp32/build/CMakeFiles/bootloader"
+		},
+		{
+			"file" : "/Users/larsemmerich/Library/Mobile Documents/com~apple~CloudDocs/Dropbox_cloud/Projekte/Schwachsinn/hsd_lima_unlocker/pn532_addr_bridge_esp32/build/CMakeFiles/bootloader.rule"
+		},
+		{
+			"file" : "/Users/larsemmerich/Library/Mobile Documents/com~apple~CloudDocs/Dropbox_cloud/Projekte/Schwachsinn/hsd_lima_unlocker/pn532_addr_bridge_esp32/build/CMakeFiles/bootloader-complete.rule"
+		},
+		{
+			"file" : "/Users/larsemmerich/Library/Mobile Documents/com~apple~CloudDocs/Dropbox_cloud/Projekte/Schwachsinn/hsd_lima_unlocker/pn532_addr_bridge_esp32/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule"
+		},
+		{
+			"file" : "/Users/larsemmerich/Library/Mobile Documents/com~apple~CloudDocs/Dropbox_cloud/Projekte/Schwachsinn/hsd_lima_unlocker/pn532_addr_bridge_esp32/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule"
+		},
+		{
+			"file" : "/Users/larsemmerich/Library/Mobile Documents/com~apple~CloudDocs/Dropbox_cloud/Projekte/Schwachsinn/hsd_lima_unlocker/pn532_addr_bridge_esp32/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule"
+		},
+		{
+			"file" : "/Users/larsemmerich/Library/Mobile Documents/com~apple~CloudDocs/Dropbox_cloud/Projekte/Schwachsinn/hsd_lima_unlocker/pn532_addr_bridge_esp32/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule"
+		},
+		{
+			"file" : "/Users/larsemmerich/Library/Mobile Documents/com~apple~CloudDocs/Dropbox_cloud/Projekte/Schwachsinn/hsd_lima_unlocker/pn532_addr_bridge_esp32/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule"
+		},
+		{
+			"file" : "/Users/larsemmerich/Library/Mobile Documents/com~apple~CloudDocs/Dropbox_cloud/Projekte/Schwachsinn/hsd_lima_unlocker/pn532_addr_bridge_esp32/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule"
+		},
+		{
+			"file" : "/Users/larsemmerich/Library/Mobile Documents/com~apple~CloudDocs/Dropbox_cloud/Projekte/Schwachsinn/hsd_lima_unlocker/pn532_addr_bridge_esp32/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"bootloader"
+		],
+		"name" : "bootloader"
+	}
+}
