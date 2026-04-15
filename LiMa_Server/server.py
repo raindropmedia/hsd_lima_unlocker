@@ -39,7 +39,7 @@ import os
 import secrets
 import sqlite3
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from werkzeug.exceptions import BadRequest
 from werkzeug.utils import secure_filename
 
@@ -69,8 +69,8 @@ OPENID_FORWARD_URL = os.getenv('OPENID_FORWARD_URL', '').strip()
 
 
 def localtime_iso():
-# Gibt aktuelle Zeit als ISO-String zurück
-    return datetime.now().isoformat(timespec='seconds')
+# Gibt aktuelle UTC-Zeit als ISO-String mit Z-Suffix zurück (timezone-safe für Browser)
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 def parse_iso_datetime(value):
@@ -166,6 +166,20 @@ def init_clients_db():
                               "ALTER TABLE bridge_config ADD COLUMN unlock_status TEXT NOT NULL DEFAULT 'locked'")
         add_column_if_missing(conn, 'bridge_config', 'unlock_remaining_min',
                               'ALTER TABLE bridge_config ADD COLUMN unlock_remaining_min INTEGER NOT NULL DEFAULT 0')
+        add_column_if_missing(conn, 'bridge_config', 'fw_version',
+                              "ALTER TABLE bridge_config ADD COLUMN fw_version TEXT NOT NULL DEFAULT ''")
+        add_column_if_missing(conn, 'bridge_config', 'auto_ota',
+                              'ALTER TABLE bridge_config ADD COLUMN auto_ota INTEGER NOT NULL DEFAULT 0')
+        add_column_if_missing(conn, 'bridge_config', 'ads0',
+                              'ALTER TABLE bridge_config ADD COLUMN ads0 INTEGER NOT NULL DEFAULT 0')
+        add_column_if_missing(conn, 'bridge_config', 'ads1',
+                              'ALTER TABLE bridge_config ADD COLUMN ads1 INTEGER NOT NULL DEFAULT 0')
+        add_column_if_missing(conn, 'bridge_config', 'ads2',
+                              'ALTER TABLE bridge_config ADD COLUMN ads2 INTEGER NOT NULL DEFAULT 0')
+        add_column_if_missing(conn, 'bridge_config', 'ads3',
+                              'ALTER TABLE bridge_config ADD COLUMN ads3 INTEGER NOT NULL DEFAULT 0')
+        add_column_if_missing(conn, 'bridge_config', 'pcf_input',
+                              'ALTER TABLE bridge_config ADD COLUMN pcf_input INTEGER NOT NULL DEFAULT 255')
 
         conn.commit()
 
@@ -434,6 +448,9 @@ def bridge_config_to_dict(cfg):
             'info_url': '',
             'unlock_duration': 30,
             'config_version': 0,
+            'auto_ota': False,
+            'ads0': 0, 'ads1': 0, 'ads2': 0, 'ads3': 0,
+            'pcf_input': 255,
         }
     return {
         'machine_name': cfg['machine_name'],
@@ -443,8 +460,14 @@ def bridge_config_to_dict(cfg):
         'idle_detection_enabled': bool(cfg['idle_detection_enabled']),
         'otp_required': bool(cfg['otp_required']),
         'info_url': cfg['info_url'],
-        'unlock_duration': cfg['unlock_duration'],
+        'unlock_duration': max(1, min(1440, int(cfg['unlock_duration'] or 30))),
         'config_version': cfg['config_version'],
+        'auto_ota': bool(cfg['auto_ota']),
+        'ads0': int(cfg['ads0'] or 0),
+        'ads1': int(cfg['ads1'] or 0),
+        'ads2': int(cfg['ads2'] or 0),
+        'ads3': int(cfg['ads3'] or 0),
+        'pcf_input': int(cfg['pcf_input'] if cfg['pcf_input'] is not None else 255),
     }
 
 
@@ -747,6 +770,13 @@ def handle_setup():
 
         client = register_client(mac_address)
         cfg = ensure_bridge_config(mac_address)
+        fw_version = (data.get('fw_version') or '').strip()[:32]
+        if fw_version:
+            with clients_db_connect() as conn:
+                conn.execute('UPDATE bridge_config SET fw_version = ? WHERE mac_address = ?',
+                             (fw_version, mac_address))
+                conn.commit()
+            cfg = get_bridge_config(mac_address)
         is_configured = bool(cfg['machine_name'] or cfg['location'])
         resp_data = {
             'valid': True,
@@ -964,11 +994,43 @@ def handle_heartbeat():
         unlock_status = data.get('unlock_status', 'locked')
         unlock_remaining_min = int(data.get('unlock_remaining_min', 0))
 
+        fw_version = (data.get('fw_version') or '').strip()[:32]
+        ads_raw = data.get('ads', [])
+        ads = [int(v) for v in ads_raw[:4]] if isinstance(ads_raw, list) else [0, 0, 0, 0]
+        while len(ads) < 4:
+            ads.append(0)
+        pcf_input = int(data.get('pcf', 255)) & 0xFF
+        idle_current_mV_raw = data.get('idle_current_mV')
+        idle_current_mV = float(idle_current_mV_raw) if idle_current_mV_raw is not None else None
         now = localtime_iso()
         with clients_db_connect() as conn:
-            conn.execute('UPDATE bridge_config SET last_heartbeat_at = ?, unlock_status = ?, unlock_remaining_min = ? WHERE mac_address = ?',
-                         (now, unlock_status, unlock_remaining_min, client['mac_address']))
+            if fw_version and idle_current_mV is not None:
+                conn.execute(
+                    'UPDATE bridge_config SET last_heartbeat_at=?, unlock_status=?, unlock_remaining_min=?,'
+                    ' fw_version=?, ads0=?, ads1=?, ads2=?, ads3=?, pcf_input=?, idle_current=? WHERE mac_address=?',
+                    (now, unlock_status, unlock_remaining_min, fw_version,
+                     ads[0], ads[1], ads[2], ads[3], pcf_input, idle_current_mV, client['mac_address']))
+            elif fw_version:
+                conn.execute(
+                    'UPDATE bridge_config SET last_heartbeat_at=?, unlock_status=?, unlock_remaining_min=?,'
+                    ' fw_version=?, ads0=?, ads1=?, ads2=?, ads3=?, pcf_input=? WHERE mac_address=?',
+                    (now, unlock_status, unlock_remaining_min, fw_version,
+                     ads[0], ads[1], ads[2], ads[3], pcf_input, client['mac_address']))
+            elif idle_current_mV is not None:
+                conn.execute(
+                    'UPDATE bridge_config SET last_heartbeat_at=?, unlock_status=?, unlock_remaining_min=?,'
+                    ' ads0=?, ads1=?, ads2=?, ads3=?, pcf_input=?, idle_current=? WHERE mac_address=?',
+                    (now, unlock_status, unlock_remaining_min,
+                     ads[0], ads[1], ads[2], ads[3], pcf_input, idle_current_mV, client['mac_address']))
+            else:
+                conn.execute(
+                    'UPDATE bridge_config SET last_heartbeat_at=?, unlock_status=?, unlock_remaining_min=?,'
+                    ' ads0=?, ads1=?, ads2=?, ads3=?, pcf_input=? WHERE mac_address=?',
+                    (now, unlock_status, unlock_remaining_min,
+                     ads[0], ads[1], ads[2], ads[3], pcf_input, client['mac_address']))
             conn.commit()
+        if idle_current_mV is not None:
+            app.logger.info('[HEARTBEAT] idle_current_mV=%.3f saved for mac=%s', idle_current_mV, client['mac_address'])
 
         resp = {
             'valid': True,
@@ -1215,7 +1277,7 @@ def admin_save_user():
     otp_secret = (data.get('otp_secret') or '').strip().upper() or None
     is_active = 1 if bool(data.get('is_active', True)) else 0
     unlock_dur_raw = data.get('unlock_duration')
-    unlock_duration = int(unlock_dur_raw) if unlock_dur_raw not in (None, '', 0) else None
+    unlock_duration = max(1, min(1440, int(unlock_dur_raw))) if unlock_dur_raw not in (None, '', 0) else None
 
     if not email or not display_name:
         return jsonify({'valid': False, 'error': 'missing_fields'}), 400
@@ -1390,14 +1452,15 @@ def admin_save_bridge_config():
     if not mac:
         return jsonify({'valid': False, 'error': 'missing_mac_address'}), 400
 
-    machine_name = (data.get('machine_name') or '').strip()
-    location = (data.get('location') or '').strip()
+    machine_name = (data.get('machine_name') or '').strip()[:63]
+    location = (data.get('location') or '').strip()[:63]
     idle_current = float(data.get('idle_current', 0.0))
     sound_enabled = 1 if data.get('sound_enabled') else 0
     idle_detection_enabled = 1 if data.get('idle_detection_enabled') else 0
     otp_required = 1 if data.get('otp_required', True) else 0
-    info_url = (data.get('info_url') or '').strip()
-    unlock_duration = int(data.get('unlock_duration', 30))
+    info_url = (data.get('info_url') or '').strip()[:127]
+    unlock_duration = max(1, min(1440, int(data.get('unlock_duration', 30))))
+    auto_ota = 1 if data.get('auto_ota') else 0
 
     now = localtime_iso()
     with clients_db_connect() as conn:
@@ -1406,16 +1469,16 @@ def admin_save_bridge_config():
             new_version = existing['config_version'] + 1
             conn.execute(
                 '''UPDATE bridge_config SET machine_name=?, location=?, idle_current=?,
-                   sound_enabled=?, idle_detection_enabled=?, otp_required=?, info_url=?, unlock_duration=?, config_version=?, updated_at=?
+                   sound_enabled=?, idle_detection_enabled=?, otp_required=?, info_url=?, unlock_duration=?, auto_ota=?, config_version=?, updated_at=?
                    WHERE mac_address=?''',
-                (machine_name, location, idle_current, sound_enabled, idle_detection_enabled, otp_required, info_url, unlock_duration, new_version, now, mac),
+                (machine_name, location, idle_current, sound_enabled, idle_detection_enabled, otp_required, info_url, unlock_duration, auto_ota, new_version, now, mac),
             )
         else:
             conn.execute(
                 '''INSERT INTO bridge_config (mac_address, machine_name, location, idle_current,
-                   sound_enabled, idle_detection_enabled, otp_required, info_url, unlock_duration, config_version, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)''',
-                (mac, machine_name, location, idle_current, sound_enabled, idle_detection_enabled, otp_required, info_url, unlock_duration, now),
+                   sound_enabled, idle_detection_enabled, otp_required, info_url, unlock_duration, auto_ota, config_version, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)''',
+                (mac, machine_name, location, idle_current, sound_enabled, idle_detection_enabled, otp_required, info_url, unlock_duration, auto_ota, now),
             )
         conn.commit()
 
@@ -1580,6 +1643,32 @@ def admin_unlock_log():
 # Admin:  POST /api/admin/ota/upload, GET /api/admin/ota/info
 # ============================================================================
 
+def parse_fw_version_from_bin(filepath):
+    """Liest version-String aus ESP32-Firmware-Binary (esp_app_desc_t).
+    Layout: esp_image_header_t (24 Bytes) + esp_image_segment_header_t (8 Bytes)
+    => esp_app_desc_t ab Byte 32:
+      +0:  magic_word (uint32, 0xABCD5AA5)
+      +4:  secure_version (uint32)
+      +8:  reserv1[2] (2x uint32)
+      +16: version[32] (char[])
+    => version liegt bei Datei-Offset 48."""
+    import struct
+    try:
+        with open(filepath, 'rb') as f:
+            header = f.read(80)
+        if len(header) < 80:
+            return None
+        if header[0] != 0xE9:
+            return None
+        magic = struct.unpack_from('<I', header, 32)[0]
+        if magic != 0xABCD5432:  # ESP_APP_DESC_MAGIC_WORD (ESP-IDF 5.x)
+            return None
+        version_bytes = header[48:80]
+        version = version_bytes.split(b'\x00')[0].decode('ascii', errors='replace').strip()
+        return version if version else None
+    except Exception:
+        return None
+
 @app.route('/api/hsd/ota/check', methods=['GET'])
 def hsd_ota_check():
     # Bridge prüft ob neue Firmware verfügbar (Token aus Query)
@@ -1618,12 +1707,12 @@ def hsd_ota_firmware():
 
 @app.route('/api/admin/ota/upload', methods=['POST'])
 def admin_ota_upload():
-    # Admin lädt neue Firmware hoch (.bin + Versionsnummer)
+    # Admin lädt neue Firmware hoch (.bin, Versionsnummer optional – wird aus Binary gelesen)
     if 'firmware' not in request.files:
         return jsonify({'valid': False, 'error': 'no_file'}), 400
 
     file = request.files['firmware']
-    version = (request.form.get('version') or '').strip()
+    version_input = (request.form.get('version') or '').strip()
 
     if not file or not file.filename:
         return jsonify({'valid': False, 'error': 'empty_file'}), 400
@@ -1632,18 +1721,25 @@ def admin_ota_upload():
     if not filename.lower().endswith('.bin'):
         return jsonify({'valid': False, 'error': 'invalid_file_type'}), 400
 
-    if not version:
-        return jsonify({'valid': False, 'error': 'missing_version'}), 400
-
     os.makedirs(OTA_FIRMWARE_DIR, exist_ok=True)
     file.save(OTA_FIRMWARE_FILE)
+
+    # Version aus Binary auslesen
+    detected_version = parse_fw_version_from_bin(OTA_FIRMWARE_FILE)
+
+    # Manuelle Eingabe hat Vorrang; fehlt sie, nehmen wir die erkannte Version
+    version = version_input or detected_version or ''
+    if not version:
+        os.remove(OTA_FIRMWARE_FILE)
+        return jsonify({'valid': False, 'error': 'version_not_found',
+                        'hint': 'Version konnte nicht aus Binary gelesen werden. Bitte manuell angeben.'}), 400
 
     with open(OTA_VERSION_FILE, 'w') as f:
         f.write(version)
 
-    app.logger.info('[OTA_UPLOAD] firmware uploaded version=%s size=%d',
-                    version, os.path.getsize(OTA_FIRMWARE_FILE))
-    return jsonify({'valid': True, 'version': version})
+    app.logger.info('[OTA_UPLOAD] firmware uploaded version=%s detected=%s size=%d',
+                    version, detected_version or '-', os.path.getsize(OTA_FIRMWARE_FILE))
+    return jsonify({'valid': True, 'version': version, 'detected_version': detected_version or ''})
 
 
 @app.route('/api/admin/ota/info', methods=['GET'])
@@ -1654,9 +1750,12 @@ def admin_ota_info():
             version = f.read().strip()
         size = os.path.getsize(OTA_FIRMWARE_FILE)
         mtime = datetime.fromtimestamp(os.path.getmtime(OTA_FIRMWARE_FILE)).isoformat(timespec='seconds')
+        detected_version = parse_fw_version_from_bin(OTA_FIRMWARE_FILE)
         return jsonify({'valid': True, 'available': True, 'version': version,
+                        'detected_version': detected_version or '',
                         'size': size, 'uploaded_at': mtime})
-    return jsonify({'valid': True, 'available': False, 'version': '', 'size': 0, 'uploaded_at': ''})
+    return jsonify({'valid': True, 'available': False, 'version': '', 'detected_version': '',
+                    'size': 0, 'uploaded_at': ''})
 
 
 
@@ -1666,22 +1765,7 @@ def admin_ota_info():
     # Dashboard: HTML-Frontend für Status und Verwaltung
 @app.route('/')
 def dashboard():
-    latest_client = get_latest_client()
-    now = datetime.now()
-    pin_expires = parse_iso_datetime(latest_client['pin_expires']) if latest_client else None
-    pin_valid = bool(latest_client and latest_client['current_pin'] and pin_expires and now < pin_expires)
-
-    if pin_valid:
-        status_html = (
-            f"<div style='color:green; font-size:48px; letter-spacing:10px;'>{latest_client['current_pin']}</div>"
-            f"<div>UID: {latest_client['last_uid'] or '-'}</div>"
-            f"<div>Gueltig bis: {latest_client['pin_expires']}</div>"
-        )
-    else:
-        status_html = "<div style='color:orange; font-size:24px;'>Warte auf NFC...</div>"
-
-    token_value = latest_client['token'] if latest_client else ''
-    mac_value = latest_client['mac_address'] if latest_client else '-'
+    openid_value = OPENID_FORWARD_URL or '(nicht gesetzt - lokale Auth)'
 
     html = '''
     <html>
@@ -1689,7 +1773,7 @@ def dashboard():
         <meta charset="utf-8" />
         <title>LiMa Bridge Admin</title>
         <style>
-            body { font-family: Arial, sans-serif; max-width: 1200px; margin: 20px auto; padding: 20px; background: #f3f4f6; }
+            body { font-family: Arial, sans-serif; max-width: 1600px; margin: 20px auto; padding: 20px; background: #f3f4f6; }
             .card { background: white; border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin-top: 14px; }
             .menu button { margin-right: 8px; margin-bottom: 8px; }
             .section { display: none; }
@@ -1705,11 +1789,9 @@ def dashboard():
     <body>
         <h1>LiMa Bridge Server GUI</h1>
         <div class="card">
-            <h2>Live Status</h2>
-            __STATUS_HTML__
-            <div>Bridge MAC: __MAC_VALUE__</div>
-            <div class="mono">Token: __TOKEN_VALUE__</div>
-            <div class="mono">OpenID Forward URL: __OPENID_VALUE__</div>
+            <h2>Live Status <span id="liveStatusAge" style="font-size:12px; color:#9ca3af; font-weight:normal; margin-left:10px;"></span></h2>
+            <div id="liveStatusCards" style="display:flex; flex-wrap:wrap; gap:12px;">Lade...</div>
+            <div class="mono" style="margin-top:10px; font-size:12px; color:#6b7280;">OpenID Forward URL: __OPENID_VALUE__</div>
         </div>
 
         <div class="menu card">
@@ -1725,12 +1807,12 @@ def dashboard():
         <div id="users" class="section card active">
             <h2>Users DB</h2>
             <div>
-                <input id="u_id" placeholder="id (leer=neu)" />
-                <input id="u_email" placeholder="email" />
-                <input id="u_name" placeholder="display name" />
-                <input id="u_password" placeholder="password (nur bei Neu oder Aenderung)" />
-                <input id="u_uid" placeholder="nfc uid (hex)" />
-                <input id="u_unlock_dur" placeholder="Freischaltzeit (Min, leer=Bridge-Standard)" style="width:250px" type="number" step="1" min="1" />
+                <input id="u_id" placeholder="id (leer=neu)" maxlength="10" />
+                <input id="u_email" placeholder="email" maxlength="254" />
+                <input id="u_name" placeholder="display name" maxlength="64" />
+                <input id="u_password" placeholder="password (nur bei Neu oder Aenderung)" maxlength="128" />
+                <input id="u_uid" placeholder="nfc uid (hex)" maxlength="14" />
+                <input id="u_unlock_dur" placeholder="Freischaltzeit (Min, leer=Bridge-Standard)" style="width:250px" type="number" step="1" min="1" max="1440" />
                 <label><input type="checkbox" id="u_active" checked /> aktiv</label>
                 <button onclick="saveUser()">Speichern</button>
                 <button onclick="clearUserForm()">Form leeren</button>
@@ -1754,9 +1836,9 @@ def dashboard():
         <div id="clients" class="section card">
             <h2>Bridges DB</h2>
             <div>
-                <input id="c_token" placeholder="token" style="width:360px" />
-                <input id="c_mac" placeholder="mac_address" />
-                <input id="c_user_id" placeholder="user_id (optional)" />
+                <input id="c_token" placeholder="token" style="width:360px" maxlength="95" />
+                <input id="c_mac" placeholder="mac_address" maxlength="17" />
+                <input id="c_user_id" placeholder="user_id (optional)" maxlength="10" />
                 <input id="c_uid" placeholder="last_uid (optional)" />
                 <button onclick="saveClient()">Speichern</button>
                 <button onclick="clearClientForm()">Form leeren</button>
@@ -1768,15 +1850,16 @@ def dashboard():
         <div id="bridgecfg" class="section card">
             <h2>Bridge Konfiguration</h2>
             <div id="bridgecfgForm" style="display:none;">
-                <input id="bc_mac" placeholder="MAC-Adresse" style="width:200px" readonly />
-                <input id="bc_name" placeholder="Maschinenname" />
-                <input id="bc_location" placeholder="Standort" />
+                <input id="bc_mac" placeholder="MAC-Adresse" style="width:200px" maxlength="17" readonly />
+                <input id="bc_name" placeholder="Maschinenname" maxlength="63" />
+                <input id="bc_location" placeholder="Standort" maxlength="63" />
                 <input id="bc_idle" placeholder="Idle Strom (A)" style="width:120px" type="number" step="0.01" min="0" />
                 <label><input type="checkbox" id="bc_sound" /> Sound</label>
                 <label><input type="checkbox" id="bc_idle_det" /> Idle-Erkennung</label>
                 <label><input type="checkbox" id="bc_otp" checked /> OTP erforderlich</label>
-                <input id="bc_info_url" placeholder="Info URL" style="width:300px" />
-                <input id="bc_unlock_dur" placeholder="Freischaltzeit (Min)" style="width:150px" type="number" step="1" min="1" value="30" />
+                <label><input type="checkbox" id="bc_auto_ota" /> Auto-Update (OTA)</label>
+                <input id="bc_info_url" placeholder="Info URL" style="width:300px" maxlength="127" />
+                <input id="bc_unlock_dur" placeholder="Freischaltzeit (Min)" style="width:150px" type="number" step="1" min="1" max="1440" value="30" />
                 <button onclick="saveBridgeCfg()">Speichern</button>
                 <button onclick="clearBridgeCfgForm()">Abbrechen</button>
             </div>
@@ -1806,10 +1889,11 @@ def dashboard():
                 Lade Firmware-Info...
             </div>
             <form id="otaUploadForm" onsubmit="uploadFirmware(event)" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-                <input type="file" id="ota_file" accept=".bin" required style="padding:4px;" />
-                <input type="text" id="ota_version" placeholder="Version (z.B. 1.0.1)" required style="width:160px;" />
+                <input type="file" id="ota_file" accept=".bin" required style="padding:4px;" onchange="onFirmwareFileSelected(this)" />
+                <input type="text" id="ota_version" placeholder="Version (optional, wird aus Binary gelesen)" style="width:260px;" />
                 <button type="submit">Firmware hochladen</button>
             </form>
+            <div id="otaDetectedVersion" style="margin-top:6px; font-size:13px; color:#6b7280;"></div>
             <div id="otaMsg" style="margin-top:8px;"></div>
         </div>
 
@@ -2114,6 +2198,7 @@ def dashboard():
                 document.getElementById('bc_idle_det').checked = false;
                 document.getElementById('bc_info_url').value = '';
                 document.getElementById('bc_unlock_dur').value = 30;
+                document.getElementById('bc_auto_ota').checked = false;
                 document.getElementById('bridgecfgForm').style.display = 'none';
             }
 
@@ -2128,6 +2213,7 @@ def dashboard():
                 document.getElementById('bc_otp').checked = cfg.otp_required !== false && cfg.otp_required !== 0;
                 document.getElementById('bc_info_url').value = cfg.info_url || '';
                 document.getElementById('bc_unlock_dur').value = cfg.unlock_duration != null ? cfg.unlock_duration : 30;
+                document.getElementById('bc_auto_ota').checked = !!cfg.auto_ota;
                 document.getElementById('bridgecfgForm').style.display = 'block';
             }
 
@@ -2136,7 +2222,9 @@ def dashboard():
                 const now = Date.now();
                 function hbBadge(ts) {
                     if (!ts) return '<span style="color:#9ca3af;">nie</span>';
-                    const d = new Date(ts);
+                    // Timestamp ohne Zeitzoneninfo als UTC behandeln (Server speichert UTC)
+                    const tsUtc = (ts.endsWith('Z') || /[+\-]\d{2}:/.test(ts)) ? ts : ts + 'Z';
+                    const d = new Date(tsUtc);
                     const diffMs = now - d.getTime();
                     const diffMin = diffMs / 60000;
                     let color = '#22c55e';
@@ -2160,7 +2248,7 @@ def dashboard():
                     if (unconfigured) {
                         return `<tr>
                             <td>${esc(cfg.mac_address)}</td>
-                            <td colspan="9" style="color:#b91c1c; font-style:italic;">unkonfiguriert</td>
+                            <td colspan="13" style="color:#b91c1c; font-style:italic;">unkonfiguriert</td>
                             <td>${hbBadge(cfg.last_heartbeat_at)}</td>
                             <td>${esc(cfg.updated_at)}</td>
                             <td>
@@ -2173,6 +2261,19 @@ def dashboard():
                     const ulBadge = ulStatus
                         ? '<span style="color:#22c55e; font-weight:600;">' + esc(cfg.unlock_remaining_min) + ' min</span>'
                         : '<span style="color:#ef4444; font-weight:600;">Gesperrt</span>';
+                    // ADS1115: raw → mV (PGA ±2.048V: 1 LSB = 62.5 µV)
+                    const adsMv = i => ((cfg['ads' + i] || 0) * 2048 / 32768).toFixed(1);
+                    // PCF8574: Bitmaske P7..P0 als farbiger Binärstring
+                    const pcfBits = () => {
+                        const v = cfg.pcf_input !== undefined ? cfg.pcf_input : 255;
+                        let s = '';
+                        for (let b = 7; b >= 0; b--) {
+                            const bit = (v >> b) & 1;
+                            s += `<span style="color:${bit ? '#22c55e' : '#ef4444'};font-family:monospace;">${bit}</span>`;
+                            if (b === 4) s += ' ';
+                        }
+                        return s;
+                    };
                     return `<tr>
                         <td>${esc(cfg.mac_address)}</td>
                         <td>${esc(cfg.machine_name)}</td>
@@ -2184,6 +2285,10 @@ def dashboard():
                         <td>${esc(cfg.unlock_duration)} min</td>
                         <td>${ulBadge}</td>
                         <td>${esc(cfg.config_version)}</td>
+                        <td>${esc(cfg.fw_version || '-')}</td>
+                        <td>${cfg.auto_ota ? '<span style="color:#22c55e;">&#10003;</span>' : '-'}</td>
+                        <td style="font-family:monospace; white-space:nowrap;">${adsMv(0)} / ${adsMv(1)} / ${adsMv(2)} / ${adsMv(3)} mV</td>
+                        <td title="P7..P0: ${cfg.pcf_input !== undefined ? cfg.pcf_input.toString(2).padStart(8,'0') : '--------'}" style="cursor:help;">${pcfBits()}</td>
                         <td>${hbBadge(cfg.last_heartbeat_at)}</td>
                         <td>${esc(cfg.updated_at)}</td>
                         <td>
@@ -2192,7 +2297,7 @@ def dashboard():
                         </td>
                     </tr>`;
                 }).join('');
-                document.getElementById('bridgecfgTable').innerHTML = `<table><tr><th>MAC</th><th>Maschinenname</th><th>Standort</th><th>Idle Strom</th><th>Sound</th><th>Idle-Erkennung</th><th>OTP</th><th>Freischaltzeit</th><th>Freigabe</th><th>Version</th><th>Heartbeat</th><th>Updated</th><th>Aktion</th></tr>${rows}</table>`;
+                document.getElementById('bridgecfgTable').innerHTML = `<table><tr><th>MAC</th><th>Maschinenname</th><th>Standort</th><th>Idle Strom</th><th>Sound</th><th>Idle-Erkennung</th><th>OTP</th><th>Freischaltzeit</th><th>Freigabe</th><th>Version</th><th>Firmware</th><th>Auto-Update</th><th>ADS1115 (AIN0-3)</th><th>PCF8574 P7..P0</th><th>Heartbeat</th><th>Updated</th><th>Aktion</th></tr>${rows}</table>`;
             }
 
             async function deleteBridgeCfg(mac) {
@@ -2222,6 +2327,7 @@ def dashboard():
                         otp_required: document.getElementById('bc_otp').checked,
                         info_url: document.getElementById('bc_info_url').value,
                         unlock_duration: parseInt(document.getElementById('bc_unlock_dur').value) || 30,
+                        auto_ota: document.getElementById('bc_auto_ota').checked,
                     });
                     msg.className = 'ok';
                     msg.textContent = 'Bridge Konfiguration gespeichert';
@@ -2238,8 +2344,14 @@ def dashboard():
                 try {
                     const data = await api('/api/admin/ota/info');
                     if (data.available) {
-                        el.innerHTML = `<strong>Aktuelle Firmware auf Server:</strong> v${esc(data.version)} &nbsp;|&nbsp; `
-                            + `${(data.size / 1024).toFixed(1)} KB &nbsp;|&nbsp; hochgeladen: ${esc(data.uploaded_at)}`;
+                        let info = `<strong>Aktuelle Firmware auf Server:</strong> v${esc(data.version)}`;
+                        if (data.detected_version && data.detected_version !== data.version) {
+                            info += ` <span style="color:#6b7280;">(Binary: v${esc(data.detected_version)})</span>`;
+                        } else if (data.detected_version) {
+                            info += ` <span style="color:#16a34a;">&#10003; aus Binary bestätigt</span>`;
+                        }
+                        info += ` &nbsp;|&nbsp; ${(data.size / 1024).toFixed(1)} KB &nbsp;|&nbsp; hochgeladen: ${esc(data.uploaded_at)}`;
+                        el.innerHTML = info;
                         el.style.background = '#f0fdf4';
                         el.style.borderColor = '#86efac';
                     } else {
@@ -2261,24 +2373,29 @@ def dashboard():
                 msg.textContent = 'Lade hoch...';
                 const file = document.getElementById('ota_file').files[0];
                 const version = document.getElementById('ota_version').value.trim();
-                if (!file || !version) {
+                if (!file) {
                     msg.className = 'err';
-                    msg.textContent = 'Datei und Version erforderlich.';
+                    msg.textContent = 'Bitte eine .bin-Datei auswaehlen.';
                     return;
                 }
                 const formData = new FormData();
                 formData.append('firmware', file);
-                formData.append('version', version);
+                if (version) formData.append('version', version);
                 try {
                     const res = await fetch('/api/admin/ota/upload', { method: 'POST', body: formData });
                     const data = await res.json();
                     if (res.ok && data.valid) {
+                        let text = `Firmware v${data.version} erfolgreich hochgeladen.`;
+                        if (data.detected_version) {
+                            text += ` (Erkannte Version aus Binary: v${data.detected_version})`;
+                        }
                         msg.className = 'ok';
-                        msg.textContent = `Firmware v${data.version} erfolgreich hochgeladen.`;
+                        msg.textContent = text;
                         document.getElementById('otaUploadForm').reset();
+                        document.getElementById('otaDetectedVersion').textContent = '';
                         await loadOtaInfo();
                     } else {
-                        throw new Error(JSON.stringify(data));
+                        throw new Error(data.hint || JSON.stringify(data));
                     }
                 } catch (e) {
                     msg.className = 'err';
@@ -2286,23 +2403,127 @@ def dashboard():
                 }
             }
 
+            function onFirmwareFileSelected(input) {
+                const hint = document.getElementById('otaDetectedVersion');
+                const versionField = document.getElementById('ota_version');
+                if (!input.files || !input.files[0]) { hint.textContent = ''; return; }
+                const file = input.files[0];
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    const buf = new Uint8Array(e.target.result);
+                    if (buf.length < 80 || buf[0] !== 0xE9) {
+                        hint.textContent = 'Kein gueltiges ESP32-Binary.';
+                        hint.style.color = '#ef4444';
+                        return;
+                    }
+                    // Check app desc magic at offset 32 (little-endian 0xABCD5432, ESP-IDF 5.x)
+                    // >>> 0 konvertiert zu unsigned 32-bit (nötig weil bit 31 gesetzt ist)
+                    const magic = (buf[32] | (buf[33] << 8) | (buf[34] << 16) | (buf[35] << 24)) >>> 0;
+                    if (magic !== 0xABCD5432) {
+                        hint.textContent = 'App-Deskriptor nicht gefunden.';
+                        hint.style.color = '#f59e0b';
+                        return;
+                    }
+                    // Version string at offset 48, max 32 bytes, null-terminated
+                    let ver = '';
+                    for (let i = 48; i < 80 && buf[i] !== 0; i++) {
+                        ver += String.fromCharCode(buf[i]);
+                    }
+                    if (ver) {
+                        hint.textContent = '\u2714 Erkannte Version im Binary: v' + ver;
+                        hint.style.color = '#16a34a';
+                        if (!versionField.value) versionField.value = ver;
+                    } else {
+                        hint.textContent = 'Version nicht lesbar.';
+                        hint.style.color = '#f59e0b';
+                    }
+                };
+                reader.readAsArrayBuffer(file.slice(0, 80));
+            }
+
+            // ── Live Status: auto-refresh alle 15s ──────────────────────────────
+            async function loadLiveStatus() {
+                const container = document.getElementById('liveStatusCards');
+                const ageEl    = document.getElementById('liveStatusAge');
+                try {
+                    const data = await api('/api/admin/bridge_config');
+                    const now  = Date.now();
+
+                    if (!data.configs || data.configs.length === 0) {
+                        container.innerHTML = '<span style="color:#9ca3af;">Keine Bridges registriert.</span>';
+                        return;
+                    }
+
+                    container.innerHTML = data.configs.map(cfg => {
+                        const unlocked = cfg.unlock_status === 'unlocked';
+                        const cardBorder = unlocked ? '#22c55e' : '#e5e7eb';
+                        const cardBg    = unlocked ? '#f0fdf4' : '#ffffff';
+
+                        // Heartbeat-Alter
+                        let hbText = 'nie';
+                        let hbColor = '#9ca3af';
+                        if (cfg.last_heartbeat_at) {
+                            const ts = cfg.last_heartbeat_at.endsWith('Z') ? cfg.last_heartbeat_at : cfg.last_heartbeat_at + 'Z';
+                            const diffMin = (now - new Date(ts).getTime()) / 60000;
+                            if (diffMin < 10) { hbColor = '#22c55e'; }
+                            else if (diffMin < 1440) { hbColor = '#ef4444'; }
+                            else { hbColor = '#9ca3af'; }
+                            hbText = diffMin < 1 ? '<1min' :
+                                     diffMin < 60 ? Math.floor(diffMin) + 'min' :
+                                     diffMin < 1440 ? Math.floor(diffMin/60) + 'h ' + (Math.floor(diffMin)%60) + 'min' :
+                                     Math.floor(diffMin/1440) + 'd';
+                        }
+
+                        // Freischalt-Badge
+                        const ulBadge = unlocked
+                            ? `<span style="background:#dcfce7;color:#166534;padding:2px 8px;border-radius:999px;font-weight:700;">&#128275; Frei&nbsp;${esc(cfg.unlock_remaining_min)}&nbsp;min</span>`
+                            : `<span style="background:#fee2e2;color:#b91c1c;padding:2px 8px;border-radius:999px;font-weight:700;">&#128274; Gesperrt</span>`;
+
+                        const name     = cfg.machine_name || cfg.mac_address;
+                        const location = cfg.location ? `<div style="color:#6b7280;font-size:12px;">${esc(cfg.location)}</div>` : '';
+                        const fw       = cfg.fw_version ? `<div style="color:#6b7280;font-size:12px;">FW: v${esc(cfg.fw_version)}</div>` : '';
+                        const lastUid  = cfg.last_uid ? `<div style="color:#6b7280;font-size:12px;">UID: ${esc(cfg.last_uid)}</div>` : '';
+
+                        return `<div style="border:2px solid ${cardBorder};background:${cardBg};border-radius:10px;padding:14px;min-width:220px;max-width:280px;">
+                            <div style="font-weight:700;font-size:15px;margin-bottom:4px;">${esc(name)}</div>
+                            ${location}
+                            <div style="margin:8px 0;">${ulBadge}</div>
+                            ${fw}${lastUid}
+                            <div style="color:${hbColor};font-size:12px;margin-top:6px;">&#9679; Heartbeat: ${hbText}</div>
+                            <div style="color:#9ca3af;font-size:11px;margin-top:2px;font-family:monospace;">${esc(cfg.mac_address)}</div>
+                        </div>`;
+                    }).join('');
+
+                    ageEl.textContent = 'aktualisiert ' + new Date().toLocaleTimeString();
+                } catch(e) {
+                    container.innerHTML = '<span style="color:#b91c1c;">Fehler: ' + e + '</span>';
+                }
+            }
+
             loadAll();
+            loadLiveStatus();
+            setInterval(loadLiveStatus, 15000);
         </script>
     </body>
     </html>
     '''
 
-    html = html.replace('__STATUS_HTML__', status_html)
-    html = html.replace('__MAC_VALUE__', mac_value)
-    html = html.replace('__TOKEN_VALUE__', token_value or '-')
-    html = html.replace('__OPENID_VALUE__', OPENID_FORWARD_URL or '(nicht gesetzt - lokale Auth)')
+    html = html.replace('__OPENID_VALUE__', openid_value)
     return html
+
+
+@app.route('/favicon.ico')
+@app.route('/robots.txt')
+@app.route('/sitemap.xml')
+def suppress_browser_noise():
+    return '', 204
 
 
 if __name__ == '__main__':
     os.makedirs(OTA_FIRMWARE_DIR, exist_ok=True)
-    if not os.path.exists('server.crt'):
-        os.system('openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 365 -nodes -subj "/CN=localhost"')
+    #if not os.path.exists('server.crt'):
+        #os.system('openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 365 -nodes -subj "/CN=localhost"')
 
-    print('https://localhost:5555')
-    app.run(host='0.0.0.0', port=5555, ssl_context=('server.crt', 'server.key'))
+    print('http://localhost:5555')
+    #app.run(host='0.0.0.0', port=5555, ssl_context=('server.crt', 'server.key'))
+    app.run(host='127.0.0.1', port=5555)

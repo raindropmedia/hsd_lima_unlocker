@@ -39,6 +39,7 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_eap_client.h"
 #include "esp_mac.h"
 #include "lvgl.h"
 #include "bsp/esp-bsp.h"
@@ -59,7 +60,7 @@
  * ════════════════════════════════════════════════════════════════════════════ */
 #define ENABLE_NFC 1
 
-#define APP_VERSION "1.0.1"
+/* APP_VERSION wird per target_compile_definitions aus PROJECT_VER (root CMakeLists.txt) gesetzt */
 
 #if ENABLE_NFC
 #define PN532_I2C_ADDR        0x54
@@ -77,27 +78,27 @@
 #define AUTH_TASK_CORE_ID 1
 
 #define WIFI_NAMESPACE "wifi_cfg"
-#define WIFI_CFG_VERSION 1
+#define WIFI_CFG_VERSION 2
 #define AUTH_NAMESPACE "auth_cfg"
 #define AUTH_CFG_VERSION 1
 
 #define PWRKEY_GPIO GPIO_NUM_16
 
 #define BRIDGE_CFG_NAMESPACE "bridge_cfg"
-#define BRIDGE_CFG_VERSION 1
+#define BRIDGE_CFG_VERSION 2
 #define HEARTBEAT_INTERVAL_MS (5 * 60 * 1000)
 #define HEARTBEAT_INTERVAL_UNCONFIGURED_MS (1 * 60 * 1000)
 
 /* Server-Endpunkte – alle Authentifizierungs-URLs zeigen auf den LiMa Server */
-#define AUTH_URL_SETUP "https://192.168.0.241:5555/api/hsd/setup"
-#define AUTH_URL_NFC "https://192.168.0.241:5555/api/hsd/nfc"
-#define AUTH_URL_LOGIN "https://192.168.0.241:5555/api/hsd/login"
-#define AUTH_URL_PIN "https://192.168.0.241:5555/api/hsd/pin"
-#define AUTH_URL_HEARTBEAT "https://192.168.0.241:5555/api/hsd/heartbeat"
-#define AUTH_URL_REGISTER_CARD "https://192.168.0.241:5555/api/hsd/register_card"
-#define OTA_URL_CHECK "https://192.168.0.241:5555/api/hsd/ota/check"
-#define OTA_URL_FIRMWARE "https://192.168.0.241:5555/api/hsd/ota/firmware"
-#define DEV_TLS_INSECURE 1
+#define AUTH_URL_SETUP         "https://lima.hsd.pub/api/hsd/setup"
+#define AUTH_URL_NFC            "https://lima.hsd.pub/api/hsd/nfc"
+#define AUTH_URL_LOGIN          "https://lima.hsd.pub/api/hsd/login"
+#define AUTH_URL_PIN            "https://lima.hsd.pub/api/hsd/pin"
+#define AUTH_URL_HEARTBEAT      "https://lima.hsd.pub/api/hsd/heartbeat"
+#define AUTH_URL_REGISTER_CARD  "https://lima.hsd.pub/api/hsd/register_card"
+#define OTA_URL_CHECK           "https://lima.hsd.pub/api/hsd/ota/check"
+#define OTA_URL_FIRMWARE        "https://lima.hsd.pub/api/hsd/ota/firmware"
+#define DEV_TLS_INSECURE 0      /* Let's Encrypt: echte Zertifikatspruefung aktiv */
 #define AUTH_HTTP_RETRY_COUNT 2
 #define AUTH_HTTP_RETRY_DELAY_MS 250
 
@@ -120,6 +121,19 @@
 #define PN532_SCAN_TIMEOUT_MS 660        /* >600ms PN532-interner RF-Scan + Puffer */
 #endif
 
+/* Externe Sensorik: ADS1115 (16-Bit-ADC, 4 Kanaele) + PCF8574T (8-Bit-I/O-Expander) */
+#define ADS1115_I2C_ADDR        0x48    /* ADDR-Pin auf GND */
+#define PCF8574_I2C_ADDR        0x20    /* A0-A2 auf GND    */
+#define ADS1115_I2C_SCL_SPEED_HZ 400000
+#define PCF8574_I2C_SCL_SPEED_HZ 400000
+
+/* PCF8574T Pin-Belegung: P0-P3 Ausgaenge (active LOW), P4-P7 Eingaenge */
+#define PCF_PIN_LED_RED    0u    /* P0: Rote LED    (active LOW: 0=an, 1=aus) */
+#define PCF_PIN_LED_GREEN  1u    /* P1: Gruene LED  (active LOW) */
+#define PCF_PIN_RELAY      2u    /* P2: Relais      (active LOW) */
+#define PCF_OUTPUT_MASK    0x0Fu /* P0-P3: Ausgaenge; HIGH=aus, LOW=an */
+#define PCF_INPUT_MASK     0xF0u /* P4-P7: Eingaenge; immer 1 schreiben */
+
 static const char *TAG = "HSD_APP";
 extern const char server_cert_pem_start[] asm("_binary_server_cert_pem_start");
 extern const char server_cert_pem_end[] asm("_binary_server_cert_pem_end");
@@ -137,6 +151,10 @@ typedef struct {
     char ip[16];
     char gateway[16];
     char netmask[16];
+    char dns[16];           /* Optionaler DNS-Server (leer = Router/DHCP-DNS) */
+    uint8_t eap_enabled;    /* 1 = WPA2-Enterprise (802.1x), 0 = PSK/Open */
+    char eap_identity[64];  /* Aeussere Identitaet (z.B. anonymous@eduroam.example.com) */
+    char eap_username[64];  /* Innere Identitaet / Username (z.B. user@eduroam.example.com) */
 } wifi_store_t;
 
 /* GUI-Ansichten: Start (NFC/Login), PIN-Eingabe, Ergebnis (Erfolg/Fehler) */
@@ -187,6 +205,7 @@ typedef struct {
     uint8_t sound_enabled;
     uint8_t idle_detection_enabled;
     uint8_t otp_required;
+    uint8_t auto_ota;           /* 1 = automatisch updaten wenn neue Version verfuegbar */
     uint32_t unlock_duration_min;
     uint32_t config_version;
 } bridge_cfg_t;
@@ -214,10 +233,15 @@ typedef struct {
     lv_obj_t *wifi_ssid_dropdown;
     lv_obj_t *wifi_password_ta;
     lv_obj_t *wifi_dhcp_sw;
+    lv_obj_t *wifi_eap_sw;         /* Toggle: WPA2-Enterprise aktivieren */
+    lv_obj_t *wifi_eap_cont;       /* Container fuer Enterprise-Felder (hidden bei PSK) */
+    lv_obj_t *wifi_eap_identity_ta;/* Aeussere Identitaet (anonymous@...) */
+    lv_obj_t *wifi_eap_username_ta;/* Innere Identitaet / Username */
     lv_obj_t *wifi_static_ip_cont;
     lv_obj_t *wifi_ip_ta;
     lv_obj_t *wifi_gateway_ta;
     lv_obj_t *wifi_netmask_ta;
+    lv_obj_t *wifi_dns_ta;
     lv_obj_t *wifi_cfg_status_label;
     lv_obj_t *status_info_label;
     lv_obj_t *status_net_label;
@@ -237,6 +261,7 @@ typedef struct {
     lv_obj_t *keyboard;
     lv_obj_t *ota_status_label;
     lv_obj_t *ota_btn;
+    lv_obj_t *measure_idle_btn;
 } ui_handles_t;
 
 typedef struct {
@@ -254,6 +279,11 @@ typedef struct {
 #if ENABLE_NFC
 static i2c_master_dev_handle_t s_pn532_dev = NULL;
 #endif
+static i2c_master_dev_handle_t s_ads1115_dev = NULL;  /* ADS1115 – 16-Bit ADC            */
+static i2c_master_dev_handle_t s_pcf8574_dev = NULL;  /* PCF8574T – 8-Bit I/O-Expander   */
+static volatile int16_t s_ads_raw[4] = {0, 0, 0, 0};  /* Letzter Messwert je Kanal (raw) */
+static volatile uint8_t s_pcf_input  = 0xFF;           /* Letzter gelesener Portbyte (P4-P7) */
+static volatile uint8_t s_pcf_output = 0x0F;           /* Ausgangszustand P0-P3 (active LOW, init=alle aus) */
 static wifi_store_t s_wifi_cfg = {
     .version = WIFI_CFG_VERSION,
     .dhcp_enabled = 1,
@@ -279,6 +309,8 @@ static ui_handles_t s_ui = {0};
 static volatile bool s_auth_busy = false;
 static volatile int64_t s_auth_busy_since_us = 0;
 static volatile bool s_wifi_has_ip = false;
+static volatile bool s_wifi_scan_in_progress = false;  /* Scan laeuft: Reconnect-Loop pausieren */
+static volatile bool s_auto_ota_in_progress = false;   /* Auto-OTA-Task laeuft bereits */
 static volatile int64_t s_setup_last_attempt_us = 0;
 static bool s_setup_log_verbose = true;
 static volatile app_view_t s_current_view = APP_VIEW_START;
@@ -293,6 +325,7 @@ static lv_timer_t *s_auto_return_timer = NULL;           /* 60s Auto-Rückkehr z
 static volatile bool s_register_card_mode = false;       /* NFC-Task liest Karte für Registrierung */
 static volatile bool s_offer_card_registration = false;  /* Registrierungs-Button auf Ergebnisseite zeigen */
 static volatile bool s_auth_origin_login = false;        /* PIN-Flow kam von Login (nicht NFC) */
+static volatile float s_idle_current_measured_mV = -1.0f; /* <0 = noch nicht gemessen */
 
 static void set_label_text_color(lv_obj_t *label, const char *text, lv_color_t color);
 static void set_status_text(const char *text, lv_color_t color);
@@ -587,10 +620,38 @@ static esp_err_t wifi_connect_from_cfg(const wifi_store_t *cfg)
     }
 
     memcpy(wifi_cfg.sta.ssid, cfg->ssid, ssid_len);
-    memcpy(wifi_cfg.sta.password, cfg->password, strnlen(cfg->password, sizeof(cfg->password)));
-    wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    wifi_cfg.sta.pmf_cfg.capable = true;
-    wifi_cfg.sta.pmf_cfg.required = false;
+
+    if (cfg->eap_enabled) {
+        /* WPA2-Enterprise (PEAP/MSCHAPv2) – typisch fuer Eduroam */
+        wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_ENTERPRISE;
+        wifi_cfg.sta.pmf_cfg.capable = true;
+        wifi_cfg.sta.pmf_cfg.required = false;
+
+        /* Zertifikatspruefung deaktivieren (kein CA-Zertifikat eingebettet) */
+        esp_eap_client_set_disable_time_check(true);
+
+        /* Aeussere Identitaet (wird im unverschluesselten EAP-Teil gesendet) */
+        if (cfg->eap_identity[0] != '\0') {
+            esp_eap_client_set_identity((const unsigned char *)cfg->eap_identity,
+                                        (int)strlen(cfg->eap_identity));
+        } else {
+            esp_eap_client_clear_identity();
+        }
+
+        /* Innere Identitaet und Passwort (im verschluesselten TLS-Tunnel) */
+        esp_eap_client_set_username((const unsigned char *)cfg->eap_username,
+                                    (int)strlen(cfg->eap_username));
+        esp_eap_client_set_password((const unsigned char *)cfg->password,
+                                    (int)strlen(cfg->password));
+    } else {
+        /* PSK oder offenes Netzwerk */
+        memcpy(wifi_cfg.sta.password, cfg->password, strnlen(cfg->password, sizeof(cfg->password)));
+        /* Bei leerem Passwort: offenes Netzwerk erlauben (OPEN), sonst WPA2 erzwingen */
+        wifi_cfg.sta.threshold.authmode = (cfg->password[0] != '\0') ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+        wifi_cfg.sta.pmf_cfg.capable = true;
+        wifi_cfg.sta.pmf_cfg.required = false;
+        esp_wifi_sta_enterprise_disable();
+    }
 
     if (cfg->dhcp_enabled) {
         esp_err_t err = esp_netif_dhcpc_start(s_wifi_netif);
@@ -617,9 +678,23 @@ static esp_err_t wifi_connect_from_cfg(const wifi_store_t *cfg)
             .netmask.addr = mask.addr,
         };
         ESP_RETURN_ON_ERROR(esp_netif_set_ip_info(s_wifi_netif, &ip_info), TAG, "Set static IP failed");
+
+        /* Optionalen DNS-Server setzen (leer = Standard beibehalten) */
+        if (cfg->dns[0] != '\0') {
+            ip4_addr_t dns_addr = {0};
+            if (parse_ipv4(cfg->dns, &dns_addr)) {
+                esp_netif_dns_info_t dns_info = { .ip = { .u_addr.ip4.addr = dns_addr.addr, .type = IPADDR_TYPE_V4 } };
+                esp_netif_set_dns_info(s_wifi_netif, ESP_NETIF_DNS_MAIN, &dns_info);
+            }
+        }
     }
 
+    /* STA in IDLE bringen bevor set_config: verhindert "sta is connecting, cannot set config" */
+    esp_wifi_disconnect();
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg), TAG, "WiFi set config failed");
+    if (cfg->eap_enabled) {
+        ESP_RETURN_ON_ERROR(esp_wifi_sta_enterprise_enable(), TAG, "Enterprise enable failed");
+    }
     return esp_wifi_connect();
 }
 
@@ -631,7 +706,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     if ((event_base == WIFI_EVENT) && (event_id == WIFI_EVENT_STA_DISCONNECTED)) {
         s_wifi_has_ip = false;
         set_status_text("WLAN getrennt", lv_color_hex(0xFCA5A5));
-        if (s_wifi_cfg.ssid[0] != '\0') {
+        /* Nicht reconnecten wenn ein Scan laeuft – sonst "STA is connecting, scan not allowed" */
+        if ((s_wifi_cfg.ssid[0] != '\0') && !s_wifi_scan_in_progress) {
             esp_wifi_connect();
         }
     }
@@ -653,6 +729,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         wifi_ap_record_t *ap_records = NULL;
 
         if (esp_wifi_scan_get_ap_num(&ap_count) != ESP_OK) {
+            s_wifi_scan_in_progress = false;
+            if (s_wifi_cfg.ssid[0] != '\0') { wifi_connect_from_cfg(&s_wifi_cfg); }
             set_wifi_cfg_status_text("Scan fehlgeschlagen", lv_color_hex(0xFCA5A5));
             return;
         }
@@ -661,6 +739,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             strncpy(s_wifi_scan_options, "Kein Netzwerk gefunden", sizeof(s_wifi_scan_options) - 1);
             s_wifi_scan_options[sizeof(s_wifi_scan_options) - 1] = '\0';
             wifi_set_dropdown_options(s_wifi_scan_options);
+            s_wifi_scan_in_progress = false;
+            if (s_wifi_cfg.ssid[0] != '\0') { wifi_connect_from_cfg(&s_wifi_cfg); }
             set_wifi_cfg_status_text("Kein Netzwerk gefunden", lv_color_hex(0xFCA5A5));
             return;
         }
@@ -671,12 +751,16 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 
         ap_records = calloc(ap_count, sizeof(wifi_ap_record_t));
         if (ap_records == NULL) {
+            s_wifi_scan_in_progress = false;
+            if (s_wifi_cfg.ssid[0] != '\0') { wifi_connect_from_cfg(&s_wifi_cfg); }
             set_wifi_cfg_status_text("Zu wenig RAM fuer Scan", lv_color_hex(0xFCA5A5));
             return;
         }
 
         if (esp_wifi_scan_get_ap_records(&ap_count, ap_records) != ESP_OK) {
             free(ap_records);
+            s_wifi_scan_in_progress = false;
+            if (s_wifi_cfg.ssid[0] != '\0') { wifi_connect_from_cfg(&s_wifi_cfg); }
             set_wifi_cfg_status_text("AP-Liste Fehler", lv_color_hex(0xFCA5A5));
             return;
         }
@@ -702,6 +786,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         free(ap_records);
         wifi_set_dropdown_options(s_wifi_scan_options);
         set_wifi_cfg_status_text("Scan abgeschlossen", lv_color_hex(0x86EFAC));
+        /* Scan abgeschlossen: Flag loeschen und Verbindung neu aufbauen */
+        s_wifi_scan_in_progress = false;
+        if (s_wifi_cfg.ssid[0] != '\0') {
+            wifi_connect_from_cfg(&s_wifi_cfg);
+        }
     }
 }
 
@@ -1119,6 +1208,13 @@ static void parse_bridge_config_from_response(const char *resp)
     s_bridge_cfg.otp_required = extract_json_bool(resp, "otp_required") ? 1 : 0;
     s_bridge_cfg.unlock_duration_min = (uint32_t)extract_json_int(resp, "unlock_duration", 30);
     s_bridge_cfg.config_version = (uint32_t)extract_json_int(resp, "config_version", 0);
+    s_bridge_cfg.auto_ota = extract_json_bool(resp, "auto_ota") ? 1 : 0;
+
+    /* Server-seitiger idle_current ueberschreibt auch den lokalen Messwert,
+     * damit der Admin-Wert persistent als naechste Heartbeat-Payload genutzt wird. */
+    if (s_bridge_cfg.idle_current > 0.0f) {
+        s_idle_current_measured_mV = s_bridge_cfg.idle_current;
+    }
 
     s_bridge_cfg_updated = true;
     ESP_LOGI(TAG, "Bridge config parsed: name=%s loc=%s url=%s idle=%.2f sound=%d idle_det=%d ver=%lu",
@@ -1156,12 +1252,9 @@ static esp_err_t https_post_json(const char *url, const char *payload, int *http
         .method = HTTP_METHOD_POST,
         .transport_type = HTTP_TRANSPORT_OVER_SSL,
         .timeout_ms = 8000,
-        .cert_pem = server_cert_pem_start,
+        .crt_bundle_attach = esp_crt_bundle_attach,  /* Let's Encrypt via ESP-IDF Mozilla-Bundle */
         .event_handler = http_capture_event_handler,
         .user_data = &capture,
-    #if DEV_TLS_INSECURE
-        .skip_cert_common_name_check = true,
-    #endif
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -1221,6 +1314,11 @@ static esp_err_t https_post_json(const char *url, const char *payload, int *http
  *   REGISTER_CARD   → /api/hsd/register_card  (UID verknüpfen)
  * ════════════════════════════════════════════════════════════════════════════ */
 
+/* Vorwaertsdeklaration – Definitionen weiter unten in der Sensor-Sektion */
+static void sensors_read(void);
+static void pcf8574_set_outputs(uint8_t outputs);
+static int16_t ads1115_read_channel(uint8_t ch);
+
 static void auth_worker_task(void *arg)
 {
     LV_UNUSED(arg);
@@ -1233,7 +1331,7 @@ static void auth_worker_task(void *arg)
             continue;
         }
 
-        char payload[256] = {0};
+        char payload[512] = {0};
         char response[512] = {0};
         const char *url = AUTH_URL_NFC;
 
@@ -1245,17 +1343,24 @@ static void auth_worker_task(void *arg)
         res.token[0] = '\0';
 
         if (req.source == AUTH_SRC_SETUP) {
-            snprintf(payload, sizeof(payload), "{\"mac\":\"%s\"}", req.value_a);
+            snprintf(payload, sizeof(payload), "{\"mac\":\"%s\",\"fw_version\":\"" APP_VERSION "\"}", req.value_a);
             url = AUTH_URL_SETUP;
         } else if (req.source == AUTH_SRC_HEARTBEAT) {
             int64_t until = s_unlock_until_us;
             int64_t now_us = esp_timer_get_time();
             bool unlocked = (until > 0) && (until > now_us);
             int remaining_min = unlocked ? (int)((until - now_us) / 60000000) : 0;
+            sensors_read();  /* ADS1115 + PCF8574T vor Payload lesen (~62 ms) */
+            char idle_part[48] = "";
+            if (s_idle_current_measured_mV >= 0.0f) {
+                snprintf(idle_part, sizeof(idle_part), ",\"idle_current_mV\":%.3f", s_idle_current_measured_mV);
+            }
             snprintf(payload, sizeof(payload),
-                     "{\"token\":\"%s\",\"config_version\":%lu,\"unlock_status\":\"%s\",\"unlock_remaining_min\":%d}",
+                     "{\"token\":\"%s\",\"config_version\":%lu,\"unlock_status\":\"%s\",\"unlock_remaining_min\":%d,\"fw_version\":\"" APP_VERSION "\",\"ads\":[%d,%d,%d,%d],\"pcf\":%u%s}",
                      s_auth_cfg.token, (unsigned long)s_bridge_cfg.config_version,
-                     unlocked ? "unlocked" : "locked", remaining_min);
+                     unlocked ? "unlocked" : "locked", remaining_min,
+                     (int)s_ads_raw[0], (int)s_ads_raw[1], (int)s_ads_raw[2], (int)s_ads_raw[3],
+                     (unsigned)s_pcf_input, idle_part);
             url = AUTH_URL_HEARTBEAT;
         } else if (req.source == AUTH_SRC_NFC) {
             snprintf(payload, sizeof(payload), "{\"token\":\"%s\",\"uid\":\"%s\"}", s_auth_cfg.token, req.value_a);
@@ -1371,6 +1476,9 @@ static void update_machine_info_ui(void)
  * Läuft im LVGL-Kontext (Core 1) – darf UI-Elemente direkt ändern.
  * ════════════════════════════════════════════════════════════════════════════ */
 
+/* Vorwaertsdeklaration (Definition weiter unten, nach OTA-Sektion) */
+static void auto_ota_task(void *arg);
+
 static void auth_result_timer_cb(lv_timer_t *timer)
 {
     LV_UNUSED(timer);
@@ -1400,6 +1508,10 @@ static void auth_result_timer_cb(lv_timer_t *timer)
                 } else {
                     set_status_text("Registriert, unkonfiguriert", lv_color_hex(0xFDE68A));
                 }
+                if (s_bridge_cfg.auto_ota && !s_auto_ota_in_progress) {
+                    s_auto_ota_in_progress = true;
+                    xTaskCreatePinnedToCore(auto_ota_task, "auto_ota", 8192, NULL, 4, NULL, AUTH_TASK_CORE_ID);
+                }
             } else if (server_unreachable) {
                 ESP_LOGW(TAG, "Setup failed: server unreachable (http_status=%d)", res.http_status);
                 set_status_text("Setup Server nicht erreichbar", lv_color_hex(0xFCA5A5));
@@ -1418,6 +1530,10 @@ static void auth_result_timer_cb(lv_timer_t *timer)
                 } else {
                     ESP_LOGI(TAG, "Heartbeat OK (unkonfiguriert)");
                     set_status_text("Registriert, unkonfiguriert", lv_color_hex(0xFDE68A));
+                }
+                if (s_bridge_cfg.auto_ota && !s_auto_ota_in_progress) {
+                    s_auto_ota_in_progress = true;
+                    xTaskCreatePinnedToCore(auto_ota_task, "auto_ota", 8192, NULL, 4, NULL, AUTH_TASK_CORE_ID);
                 }
             } else if ((res.http_status >= 400) && (res.http_status < 500)) {
                 ESP_LOGW(TAG, "Stored token invalid (http_status=%d), re-registering", res.http_status);
@@ -1508,6 +1624,24 @@ static void textarea_focus_event_cb(lv_event_t *event)
     } else if (code == LV_EVENT_DEFOCUSED) {
         lv_keyboard_set_textarea(s_ui.keyboard, NULL);
         lv_obj_add_flag(s_ui.keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* Auge-Button: Passwort-Sichtbarkeit umschalten.
+ * user_data des Events zeigt auf das zugehoerige lv_textarea. */
+static void pwd_toggle_event_cb(lv_event_t *event)
+{
+    lv_obj_t *btn = lv_event_get_target(event);
+    lv_obj_t *ta  = (lv_obj_t *)lv_event_get_user_data(event);
+    if (ta == NULL) {
+        return;
+    }
+    bool hidden = lv_textarea_get_password_mode(ta);
+    lv_textarea_set_password_mode(ta, !hidden);
+    /* Symbol je nach Zustand aktualisieren */
+    lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+    if (lbl) {
+        lv_label_set_text(lbl, hidden ? LV_SYMBOL_EYE_CLOSE : LV_SYMBOL_EYE_OPEN);
     }
 }
 
@@ -1738,6 +1872,9 @@ static void wifi_cfg_close_event_cb(lv_event_t *event)
     lv_obj_add_flag(s_ui.wifi_cfg_modal, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_ui.keyboard, LV_OBJ_FLAG_HIDDEN);
     lv_keyboard_set_textarea(s_ui.keyboard, NULL);
+    if (s_ui.unlock_indicator) {
+        lv_obj_clear_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_HIDDEN);
+    }
 
     bsp_display_unlock();
 }
@@ -1752,8 +1889,21 @@ static void wifi_scan_event_cb(lv_event_t *event)
     };
 
     set_wifi_cfg_status_text("Scanne WLAN...", lv_color_hex(0xFDE68A));
+
+    /* Verbindungsversuch abbrechen bevor Scan startet.
+     * STA darf nicht gleichzeitig verbinden und scannen. */
+    s_wifi_scan_in_progress = true;
+    esp_wifi_disconnect();
+    /* Kurz warten damit DISCONNECTED-Event verarbeitet wird */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
     esp_err_t err = esp_wifi_scan_start(&scan_cfg, false);
     if (err != ESP_OK) {
+        s_wifi_scan_in_progress = false;
+        /* Verbindung wiederherstellen falls Scan nicht startete */
+        if (s_wifi_cfg.ssid[0] != '\0') {
+            wifi_connect_from_cfg(&s_wifi_cfg);
+        }
         set_wifi_cfg_status_text("Scan Start Fehler", lv_color_hex(0xFCA5A5));
     }
 }
@@ -1784,14 +1934,7 @@ static void ota_task(void *arg)
 
     esp_http_client_config_t http_cfg = {
         .url = url_with_token,
-#if DEV_TLS_INSECURE
-        .skip_cert_common_name_check = true,
-        .transport_type = HTTP_TRANSPORT_OVER_SSL,
-        .crt_bundle_attach = NULL,
-        .cert_pem = server_cert_pem_start,
-#else
-        .cert_pem = server_cert_pem_start,
-#endif
+        .crt_bundle_attach = esp_crt_bundle_attach,  /* Let's Encrypt via ESP-IDF Mozilla-Bundle */
         .timeout_ms = 60000,
         .keep_alive_enable = true,
         .buffer_size = 4096,
@@ -1854,14 +1997,7 @@ static void ota_check_event_cb(lv_event_t *event)
 
     esp_http_client_config_t http_cfg = {
         .url = url,
-#if DEV_TLS_INSECURE
-        .skip_cert_common_name_check = true,
-        .transport_type = HTTP_TRANSPORT_OVER_SSL,
-        .crt_bundle_attach = NULL,
-        .cert_pem = server_cert_pem_start,
-#else
-        .cert_pem = server_cert_pem_start,
-#endif
+        .crt_bundle_attach = esp_crt_bundle_attach,  /* Let's Encrypt via ESP-IDF Mozilla-Bundle */
         .timeout_ms = 10000,
         .event_handler = http_capture_event_handler,
         .user_data = &cap,
@@ -1931,6 +2067,99 @@ static void ota_check_event_cb(lv_event_t *event)
     }
 }
 
+/* Auto-OTA-Task: Wird nach Heartbeat/Setup gestartet wenn auto_ota konfiguriert.
+ * Prueft Server auf neue Firmware und flasht automatisch. */
+static void auto_ota_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "Auto-OTA check started");
+
+    if (!s_wifi_has_ip || !auth_has_token()) {
+        s_auto_ota_in_progress = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    char url[256] = {0};
+    snprintf(url, sizeof(url), "%s?token=%s&version=%s", OTA_URL_CHECK, s_auth_cfg.token, APP_VERSION);
+
+    char response_buf[256] = {0};
+    http_capture_t cap = {
+        .response = response_buf,
+        .response_size = sizeof(response_buf),
+        .response_len = 0,
+        .token = NULL,
+        .token_size = 0,
+    };
+
+    esp_http_client_config_t http_cfg = {
+        .url = url,
+        .crt_bundle_attach = esp_crt_bundle_attach,  /* Let's Encrypt via ESP-IDF Mozilla-Bundle */
+        .timeout_ms = 10000,
+        .event_handler = http_capture_event_handler,
+        .user_data = &cap,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
+    if (!client) {
+        s_auto_ota_in_progress = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status_code = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if ((err != ESP_OK) || (status_code != 200)) {
+        ESP_LOGW(TAG, "Auto-OTA: server not reachable (err=%d status=%d)", (int)err, status_code);
+        s_auto_ota_in_progress = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    bool update_available = extract_json_bool(response_buf, "available");
+    if (!update_available) {
+        char server_ver[32] = {0};
+        extract_json_string(response_buf, "version", server_ver, sizeof(server_ver));
+        ESP_LOGI(TAG, "Auto-OTA: firmware up to date (server=%s cur=" APP_VERSION ")", server_ver);
+        s_auto_ota_in_progress = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    char new_ver[32] = {0};
+    extract_json_string(response_buf, "version", new_ver, sizeof(new_ver));
+    ESP_LOGI(TAG, "Auto-OTA: update available v%s, downloading...", new_ver);
+    set_ota_status_text("Auto-Update wird heruntergeladen...", lv_color_hex(0xFDE68A));
+
+    char url_fw[256] = {0};
+    snprintf(url_fw, sizeof(url_fw), "%s?token=%s", OTA_URL_FIRMWARE, s_auth_cfg.token);
+
+    esp_http_client_config_t fw_cfg = {
+        .url = url_fw,
+        .crt_bundle_attach = esp_crt_bundle_attach,  /* Let's Encrypt via ESP-IDF Mozilla-Bundle */
+        .timeout_ms = 60000,
+        .keep_alive_enable = true,
+        .buffer_size = 4096,
+        .buffer_size_tx = 1024,
+    };
+
+    esp_https_ota_config_t ota_cfg = { .http_config = &fw_cfg };
+    esp_err_t ota_err = esp_https_ota(&ota_cfg);
+    if (ota_err == ESP_OK) {
+        ESP_LOGI(TAG, "Auto-OTA success, rebooting...");
+        set_ota_status_text("Auto-Update OK - Neustart...", lv_color_hex(0x86EFAC));
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        esp_restart();
+    } else {
+        ESP_LOGE(TAG, "Auto-OTA failed: %s", esp_err_to_name(ota_err));
+        set_ota_status_text("Auto-Update fehlgeschlagen!", lv_color_hex(0xFCA5A5));
+        s_auto_ota_in_progress = false;
+    }
+    vTaskDelete(NULL);
+}
+
 /* DHCP-Schalter: statische IP-Felder ein-/ausblenden */
 static void wifi_dhcp_toggle_event_cb(lv_event_t *event)
 {
@@ -1943,6 +2172,21 @@ static void wifi_dhcp_toggle_event_cb(lv_event_t *event)
         lv_obj_add_flag(s_ui.wifi_static_ip_cont, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_clear_flag(s_ui.wifi_static_ip_cont, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* Enterprise-Schalter: Identity/Username-Felder und Passwort-Label ein-/ausblenden */
+static void wifi_eap_toggle_event_cb(lv_event_t *event)
+{
+    LV_UNUSED(event);
+    if (!s_ui.wifi_eap_cont) {
+        return;
+    }
+    bool eap = lv_obj_has_state(s_ui.wifi_eap_sw, LV_STATE_CHECKED);
+    if (eap) {
+        lv_obj_clear_flag(s_ui.wifi_eap_cont, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_ui.wifi_eap_cont, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -1965,6 +2209,29 @@ static void wifi_cfg_save_connect_event_cb(lv_event_t *event)
     strncpy(s_wifi_cfg.password, lv_textarea_get_text(s_ui.wifi_password_ta), sizeof(s_wifi_cfg.password) - 1);
     s_wifi_cfg.password[sizeof(s_wifi_cfg.password) - 1] = '\0';
 
+    /* WPA2-Enterprise (802.1x) */
+    bool eap = lv_obj_has_state(s_ui.wifi_eap_sw, LV_STATE_CHECKED);
+    s_wifi_cfg.eap_enabled = eap ? 1 : 0;
+    if (eap) {
+        if (s_wifi_cfg.password[0] == '\0') {
+            set_wifi_cfg_status_text("Passwort fuer Enterprise benoetigt", lv_color_hex(0xFCA5A5));
+            return;
+        }
+        const char *identity_text = lv_textarea_get_text(s_ui.wifi_eap_identity_ta);
+        const char *username_text = lv_textarea_get_text(s_ui.wifi_eap_username_ta);
+        if (username_text[0] == '\0') {
+            set_wifi_cfg_status_text("Username benoetigt", lv_color_hex(0xFCA5A5));
+            return;
+        }
+        strncpy(s_wifi_cfg.eap_identity, identity_text, sizeof(s_wifi_cfg.eap_identity) - 1);
+        s_wifi_cfg.eap_identity[sizeof(s_wifi_cfg.eap_identity) - 1] = '\0';
+        strncpy(s_wifi_cfg.eap_username, username_text, sizeof(s_wifi_cfg.eap_username) - 1);
+        s_wifi_cfg.eap_username[sizeof(s_wifi_cfg.eap_username) - 1] = '\0';
+    } else {
+        s_wifi_cfg.eap_identity[0] = '\0';
+        s_wifi_cfg.eap_username[0] = '\0';
+    }
+
     /* DHCP / statische IP */
     bool dhcp = lv_obj_has_state(s_ui.wifi_dhcp_sw, LV_STATE_CHECKED);
     s_wifi_cfg.dhcp_enabled = dhcp ? 1 : 0;
@@ -1985,6 +2252,20 @@ static void wifi_cfg_save_connect_event_cb(lv_event_t *event)
         s_wifi_cfg.gateway[sizeof(s_wifi_cfg.gateway) - 1] = '\0';
         strncpy(s_wifi_cfg.netmask, nm_text, sizeof(s_wifi_cfg.netmask) - 1);
         s_wifi_cfg.netmask[sizeof(s_wifi_cfg.netmask) - 1] = '\0';
+
+        /* DNS: optional, leer ist erlaubt; falls angegeben muss IP gueltig sein */
+        const char *dns_text = lv_textarea_get_text(s_ui.wifi_dns_ta);
+        if (dns_text[0] != '\0') {
+            ip4_addr_t dns_tmp = {0};
+            if (!parse_ipv4(dns_text, &dns_tmp)) {
+                set_wifi_cfg_status_text("Ungueltige DNS-Adresse", lv_color_hex(0xFCA5A5));
+                return;
+            }
+            strncpy(s_wifi_cfg.dns, dns_text, sizeof(s_wifi_cfg.dns) - 1);
+            s_wifi_cfg.dns[sizeof(s_wifi_cfg.dns) - 1] = '\0';
+        } else {
+            s_wifi_cfg.dns[0] = '\0';
+        }
     }
 
     esp_err_t err = wifi_cfg_save(&s_wifi_cfg);
@@ -2016,10 +2297,16 @@ static void status_update_info(void)
         char ip_str[16] = "-";
         char gw_str[16] = "-";
         char mask_str[16] = "-";
+        char dns_str[16] = "-";
         if (s_wifi_netif && (esp_netif_get_ip_info(s_wifi_netif, &ip_info) == ESP_OK) && ip_info.ip.addr) {
             snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
             snprintf(gw_str, sizeof(gw_str), IPSTR, IP2STR(&ip_info.gw));
             snprintf(mask_str, sizeof(mask_str), IPSTR, IP2STR(&ip_info.netmask));
+        }
+        esp_netif_dns_info_t dns_info = {0};
+        if (s_wifi_netif && (esp_netif_get_dns_info(s_wifi_netif, ESP_NETIF_DNS_MAIN, &dns_info) == ESP_OK)
+            && dns_info.ip.u_addr.ip4.addr != 0) {
+            snprintf(dns_str, sizeof(dns_str), IPSTR, IP2STR(&dns_info.ip.u_addr.ip4));
         }
         snprintf(buf, sizeof(buf),
                  "MAC: %s\n"
@@ -2028,12 +2315,13 @@ static void status_update_info(void)
                  "IP: %s\n"
                  "Gateway: %s\n"
                  "Netmask: %s\n"
+                 "DNS: %s\n"
                  "WLAN: %s\n"
                  "Token: %s",
                  mac_buf,
                  s_wifi_cfg.ssid[0] ? s_wifi_cfg.ssid : "-",
                  s_wifi_cfg.dhcp_enabled ? "Ja" : "Nein",
-                 ip_str, gw_str, mask_str,
+                 ip_str, gw_str, mask_str, dns_str,
                  s_wifi_has_ip ? "Verbunden" : "Getrennt",
                  auth_has_token() ? "Vorhanden" : "Fehlt");
         lv_label_set_text(s_ui.status_net_label, buf);
@@ -2247,6 +2535,9 @@ static void pwrkey_timer_cb(lv_timer_t *timer)
             if (s_ui.wifi_cfg_modal) {
                 lv_obj_clear_flag(s_ui.wifi_cfg_modal, LV_OBJ_FLAG_HIDDEN);
             }
+            if (s_ui.unlock_indicator) {
+                lv_obj_add_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_HIDDEN);
+            }
             bsp_display_unlock();
         }
     }
@@ -2347,6 +2638,11 @@ static void unlock_timer_cb(lv_timer_t *timer)
     if (!s_ui.unlock_indicator) {
         return;
     }
+    /* Modal offen: Indikator nicht anzeigen, Zustand nicht verändern */
+    if (s_ui.wifi_cfg_modal && !lv_obj_has_flag(s_ui.wifi_cfg_modal, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_add_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
 
     int64_t now_us = esp_timer_get_time();
     int64_t until = s_unlock_until_us;
@@ -2364,6 +2660,10 @@ static void unlock_timer_cb(lv_timer_t *timer)
         if (s_ui.login_btn) {
             lv_obj_clear_flag(s_ui.login_btn, LV_OBJ_FLAG_HIDDEN);
         }
+        /* PCF: Rote LED an wenn verbunden+angemeldet, sonst alles aus */
+        pcf8574_set_outputs((s_wifi_has_ip && auth_has_token())
+            ? (uint8_t)(PCF_OUTPUT_MASK & ~(1u << PCF_PIN_LED_RED))
+            : PCF_OUTPUT_MASK);
         return;
     }
 
@@ -2385,6 +2685,10 @@ static void unlock_timer_cb(lv_timer_t *timer)
         if (s_ui.login_btn) {
             lv_obj_clear_flag(s_ui.login_btn, LV_OBJ_FLAG_HIDDEN);
         }
+        /* PCF: Rote LED an wenn verbunden+angemeldet, sonst alles aus */
+        pcf8574_set_outputs((s_wifi_has_ip && auth_has_token())
+            ? (uint8_t)(PCF_OUTPUT_MASK & ~(1u << PCF_PIN_LED_RED))
+            : PCF_OUTPUT_MASK);
         return;
     }
 
@@ -2405,10 +2709,16 @@ static void unlock_timer_cb(lv_timer_t *timer)
         } else {
             lv_obj_add_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_HIDDEN);
         }
+        /* PCF: Gruene LED blinkt im Gleichlauf; Relais bleibt permanent aktiv */
+        pcf8574_set_outputs(blink_on
+            ? (uint8_t)(PCF_OUTPUT_MASK & ~((1u << PCF_PIN_LED_GREEN) | (1u << PCF_PIN_RELAY)))
+            : (uint8_t)(PCF_OUTPUT_MASK & ~(1u << PCF_PIN_RELAY)));
     } else {
         /* Unlocked — green */
         lv_obj_set_style_bg_color(s_ui.unlock_indicator, lv_color_hex(0x22C55E), 0);
         lv_obj_clear_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_HIDDEN);
+        /* PCF: Gruene LED an, Relais aktiv */
+        pcf8574_set_outputs((uint8_t)(PCF_OUTPUT_MASK & ~((1u << PCF_PIN_LED_GREEN) | (1u << PCF_PIN_RELAY))));
     }
     if (s_ui.unlock_text_label) {
         lv_label_set_text(s_ui.unlock_text_label, time_buf);
@@ -2428,6 +2738,97 @@ static void revoke_unlock_event_cb(lv_event_t *event)
     s_unlock_until_us = 0;
     ESP_LOGI(TAG, "Unlock revoked by user");
     s_last_heartbeat_us = 0;
+}
+
+/* Idle-Strom messen via ADS1115 (Kanal 0).
+ * Fuehrt IDLE_MEASURE_SAMPLES Single-Shot-Messungen durch, sortiert die Werte
+ * und bildet einen Trimmed-Mean (ohne kleinstes und groesstes Ergebnis).
+ * Rueckgabe: Durchschnitts-Spannung in mV (1 LSB = ADS_LSB_uV µV, PGA ±2.048 V).
+ * Negativer Rueckgabewert = ADS1115 nicht verfuegbar. */
+#define IDLE_MEASURE_SAMPLES   5
+#define ADS_LSB_uV             62.5f  /* 2048 mV / 32768 LSB */
+static float measure_idle_current_mV(void)
+{
+    if (s_ads1115_dev == NULL) {
+        return -1.0f;
+    }
+    int32_t readings[IDLE_MEASURE_SAMPLES];
+    for (int i = 0; i < IDLE_MEASURE_SAMPLES; i++) {
+        readings[i] = (int32_t)ads1115_read_channel(0);
+        /* ads1115_read_channel enthaelt bereits ~15 ms Wartezeit */
+    }
+    /* Insertion-Sort aufsteigend */
+    for (int i = 1; i < IDLE_MEASURE_SAMPLES; i++) {
+        int32_t key = readings[i];
+        int j = i - 1;
+        while ((j >= 0) && (readings[j] > key)) {
+            readings[j + 1] = readings[j];
+            j--;
+        }
+        readings[j + 1] = key;
+    }
+    /* Trimmed Mean: erstes (min) und letztes (max) verwerfen */
+    int32_t sum = 0;
+    for (int i = 1; i < (IDLE_MEASURE_SAMPLES - 1); i++) {
+        sum += readings[i];
+    }
+    float avg_raw = (float)sum / (float)(IDLE_MEASURE_SAMPLES - 2);
+    return avg_raw * ADS_LSB_uV / 1000.0f;  /* µV → mV */
+}
+
+/* Hintergrund-Task fuer Idle-Strommessung: laeuft ausserhalb des LVGL-Tasks
+ * (Gesamtdauer ~5 × 15 ms = 75 ms), aktualisiert UI und loest Heartbeat aus. */
+static void idle_measure_task(void *arg)
+{
+    (void)arg;
+    float mV = measure_idle_current_mV();
+    s_idle_current_measured_mV = mV;
+    ESP_LOGI(TAG, "Idle current measured: %.3f mV (ADS1115 ch0)", mV);
+    /* Persistent speichern: Wert in Bridge-Config schreiben und NVS-Save triggern */
+    if (mV >= 0.0f) {
+        s_bridge_cfg.idle_current = mV;
+        s_bridge_cfg_updated = true;
+    }
+
+    char msg[72];
+    lv_color_t col;
+    if (mV < 0.0f) {
+        snprintf(msg, sizeof(msg), "Messung fehlgeschlagen (ADS1115)");
+        col = lv_color_hex(0xFCA5A5);
+    } else {
+        snprintf(msg, sizeof(msg), "Idle: %.2f mV  (wird uebermittelt)", mV);
+        col = lv_color_hex(0x86EFAC);
+    }
+    if (s_ui.status_bridge_label && bsp_display_lock(100)) {
+        lv_label_set_text(s_ui.status_bridge_label, msg);
+        lv_obj_set_style_text_color(s_ui.status_bridge_label, col, 0);
+        bsp_display_unlock();
+    }
+    /* Heartbeat sofort auslösen, damit der Messwert zum Server uebertragen wird */
+    if (mV >= 0.0f) {
+        s_last_heartbeat_us = 0;
+    }
+    vTaskDelete(NULL);
+}
+
+/* Button-Callback: startet Idle-Strommessung als Hintergrund-Task */
+static void measure_idle_current_event_cb(lv_event_t *event)
+{
+    LV_UNUSED(event);
+    if (s_ui.status_bridge_label && bsp_display_lock(50)) {
+        lv_label_set_text(s_ui.status_bridge_label, "Idle-Strom wird gemessen...");
+        lv_obj_set_style_text_color(s_ui.status_bridge_label, lv_color_hex(0xFDE68A), 0);
+        bsp_display_unlock();
+    }
+    BaseType_t ok = xTaskCreatePinnedToCore(idle_measure_task, "idle_meas", 4096, NULL, 3, NULL, AUTH_TASK_CORE_ID);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "idle_measure_task creation failed");
+        if (s_ui.status_bridge_label && bsp_display_lock(50)) {
+            lv_label_set_text(s_ui.status_bridge_label, "Task-Fehler");
+            lv_obj_set_style_text_color(s_ui.status_bridge_label, lv_color_hex(0xFCA5A5), 0);
+            bsp_display_unlock();
+        }
+    }
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -2489,7 +2890,7 @@ static void create_ui(void)
     lv_obj_set_style_text_color(title, lv_color_hex(0xF9FAFB), 0);
 
     lv_obj_t *hint = lv_label_create(s_ui.start_container);
-    lv_label_set_text(hint, "HSD Login verwenden.");
+    lv_label_set_text(hint, "oder HSD Login verwenden.");
     lv_obj_set_style_text_color(hint, lv_color_hex(0xCBD5E1), 0);
 
     s_ui.status_label = lv_label_create(s_ui.start_container);
@@ -2681,13 +3082,36 @@ static void create_ui(void)
     lv_obj_add_event_cb(s_ui.login_email_ta, textarea_focus_event_cb, LV_EVENT_FOCUSED, NULL);
     lv_obj_add_event_cb(s_ui.login_email_ta, textarea_focus_event_cb, LV_EVENT_DEFOCUSED, NULL);
 
-    s_ui.login_password_ta = lv_textarea_create(s_ui.login_modal);
-    lv_obj_set_width(s_ui.login_password_ta, lv_pct(100));
+    /* Login-Passwortfeld mit Sichtbarkeits-Toggle */
+    lv_obj_t *login_pwd_row = lv_obj_create(s_ui.login_modal);
+    lv_obj_set_width(login_pwd_row, lv_pct(100));
+    lv_obj_set_height(login_pwd_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(login_pwd_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(login_pwd_row, 0, 0);
+    lv_obj_set_style_pad_all(login_pwd_row, 0, 0);
+    lv_obj_set_style_pad_column(login_pwd_row, 6, 0);
+    lv_obj_set_layout(login_pwd_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(login_pwd_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(login_pwd_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    s_ui.login_password_ta = lv_textarea_create(login_pwd_row);
+    lv_obj_set_flex_grow(s_ui.login_password_ta, 1);
     lv_textarea_set_one_line(s_ui.login_password_ta, true);
     lv_textarea_set_password_mode(s_ui.login_password_ta, true);
     lv_textarea_set_placeholder_text(s_ui.login_password_ta, "Passwort");
     lv_obj_add_event_cb(s_ui.login_password_ta, textarea_focus_event_cb, LV_EVENT_FOCUSED, NULL);
     lv_obj_add_event_cb(s_ui.login_password_ta, textarea_focus_event_cb, LV_EVENT_DEFOCUSED, NULL);
+
+    lv_obj_t *login_pwd_eye = lv_button_create(login_pwd_row);
+    lv_obj_set_size(login_pwd_eye, 48, 48);
+    lv_obj_set_style_radius(login_pwd_eye, 12, 0);
+    lv_obj_set_style_border_width(login_pwd_eye, 0, 0);
+    lv_obj_set_style_bg_color(login_pwd_eye, lv_color_hex(0x374151), 0);
+    lv_obj_t *login_pwd_eye_lbl = lv_label_create(login_pwd_eye);
+    lv_label_set_text(login_pwd_eye_lbl, LV_SYMBOL_EYE_OPEN);
+    lv_obj_set_style_text_color(login_pwd_eye_lbl, lv_color_hex(0xD1D5DB), 0);
+    lv_obj_center(login_pwd_eye_lbl);
+    lv_obj_add_event_cb(login_pwd_eye, pwd_toggle_event_cb, LV_EVENT_CLICKED, s_ui.login_password_ta);
 
     lv_obj_t *login_submit_btn = create_primary_button(s_ui.login_modal, "Login");
     lv_obj_add_event_cb(login_submit_btn, login_submit_event_cb, LV_EVENT_CLICKED, NULL);
@@ -2705,21 +3129,23 @@ static void create_ui(void)
     lv_obj_set_style_pad_row(s_ui.wifi_cfg_modal, 0, 0);
     lv_obj_set_layout(s_ui.wifi_cfg_modal, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(s_ui.wifi_cfg_modal, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_scrollbar_mode(s_ui.wifi_cfg_modal, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_scrollbar_mode(s_ui.wifi_cfg_modal, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(s_ui.wifi_cfg_modal, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_ui.wifi_cfg_modal, LV_OBJ_FLAG_HIDDEN);
 
     /* --- WLAN config page --- */
     s_ui.wifi_cfg_page = lv_obj_create(s_ui.wifi_cfg_modal);
     lv_obj_set_width(s_ui.wifi_cfg_page, lv_pct(100));
-    lv_obj_set_height(s_ui.wifi_cfg_page, LV_SIZE_CONTENT);
+    lv_obj_set_height(s_ui.wifi_cfg_page, 0);
+    lv_obj_set_flex_grow(s_ui.wifi_cfg_page, 1);
     lv_obj_set_style_bg_opa(s_ui.wifi_cfg_page, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_ui.wifi_cfg_page, 0, 0);
     lv_obj_set_style_pad_all(s_ui.wifi_cfg_page, 0, 0);
     lv_obj_set_style_pad_row(s_ui.wifi_cfg_page, 10, 0);
     lv_obj_set_layout(s_ui.wifi_cfg_page, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(s_ui.wifi_cfg_page, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_scrollbar_mode(s_ui.wifi_cfg_page, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_clear_flag(s_ui.wifi_cfg_page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(s_ui.wifi_cfg_page, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_add_flag(s_ui.wifi_cfg_page, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *wifi_title = lv_label_create(s_ui.wifi_cfg_page);
     lv_label_set_text(wifi_title, "WLAN Konfiguration");
@@ -2737,15 +3163,91 @@ static void create_ui(void)
     lv_obj_t *wifi_scan_btn = create_primary_button(s_ui.wifi_cfg_page, "WLAN Scan");
     lv_obj_add_event_cb(wifi_scan_btn, wifi_scan_event_cb, LV_EVENT_CLICKED, NULL);
 
-    s_ui.wifi_password_ta = lv_textarea_create(s_ui.wifi_cfg_page);
-    lv_obj_set_width(s_ui.wifi_password_ta, lv_pct(100));
+    /* WLAN-Passwortfeld mit Sichtbarkeits-Toggle */
+    lv_obj_t *wifi_pwd_row = lv_obj_create(s_ui.wifi_cfg_page);
+    lv_obj_set_width(wifi_pwd_row, lv_pct(100));
+    lv_obj_set_height(wifi_pwd_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(wifi_pwd_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(wifi_pwd_row, 0, 0);
+    lv_obj_set_style_pad_all(wifi_pwd_row, 0, 0);
+    lv_obj_set_style_pad_column(wifi_pwd_row, 6, 0);
+    lv_obj_set_layout(wifi_pwd_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(wifi_pwd_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(wifi_pwd_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    s_ui.wifi_password_ta = lv_textarea_create(wifi_pwd_row);
+    lv_obj_set_flex_grow(s_ui.wifi_password_ta, 1);
     lv_textarea_set_one_line(s_ui.wifi_password_ta, true);
     lv_textarea_set_password_mode(s_ui.wifi_password_ta, true);
     lv_textarea_set_placeholder_text(s_ui.wifi_password_ta, "Passwort");
+    lv_textarea_set_text(s_ui.wifi_password_ta, s_wifi_cfg.password[0] ? s_wifi_cfg.password : "");
     lv_obj_add_event_cb(s_ui.wifi_password_ta, textarea_focus_event_cb, LV_EVENT_FOCUSED, NULL);
     lv_obj_add_event_cb(s_ui.wifi_password_ta, textarea_focus_event_cb, LV_EVENT_DEFOCUSED, NULL);
 
-    /* --- DHCP toggle row --- */
+    lv_obj_t *wifi_pwd_eye = lv_button_create(wifi_pwd_row);
+    lv_obj_set_size(wifi_pwd_eye, 48, 48);
+    lv_obj_set_style_radius(wifi_pwd_eye, 12, 0);
+    lv_obj_set_style_border_width(wifi_pwd_eye, 0, 0);
+    lv_obj_set_style_bg_color(wifi_pwd_eye, lv_color_hex(0x374151), 0);
+    lv_obj_t *wifi_pwd_eye_lbl = lv_label_create(wifi_pwd_eye);
+    lv_label_set_text(wifi_pwd_eye_lbl, LV_SYMBOL_EYE_OPEN);
+    lv_obj_set_style_text_color(wifi_pwd_eye_lbl, lv_color_hex(0xD1D5DB), 0);
+    lv_obj_center(wifi_pwd_eye_lbl);
+    lv_obj_add_event_cb(wifi_pwd_eye, pwd_toggle_event_cb, LV_EVENT_CLICKED, s_ui.wifi_password_ta);
+
+    /* --- Enterprise (802.1x) toggle row --- */
+    lv_obj_t *eap_row = lv_obj_create(s_ui.wifi_cfg_page);
+    lv_obj_set_width(eap_row, lv_pct(100));
+    lv_obj_set_height(eap_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(eap_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(eap_row, 0, 0);
+    lv_obj_set_style_pad_all(eap_row, 0, 0);
+    lv_obj_set_style_pad_column(eap_row, 8, 0);
+    lv_obj_set_layout(eap_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(eap_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(eap_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *eap_label = lv_label_create(eap_row);
+    lv_label_set_text(eap_label, "802.1x (Eduroam)");
+    lv_obj_set_style_text_color(eap_label, lv_color_hex(0xD1D5DB), 0);
+    lv_obj_set_flex_grow(eap_label, 1);
+
+    s_ui.wifi_eap_sw = lv_switch_create(eap_row);
+    lv_obj_set_style_bg_color(s_ui.wifi_eap_sw, lv_color_hex(0x2563EB), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (s_wifi_cfg.eap_enabled) {
+        lv_obj_add_state(s_ui.wifi_eap_sw, LV_STATE_CHECKED);
+    }
+    lv_obj_add_event_cb(s_ui.wifi_eap_sw, wifi_eap_toggle_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* Container fuer EAP-spezifische Felder */
+    s_ui.wifi_eap_cont = lv_obj_create(s_ui.wifi_cfg_page);
+    lv_obj_set_width(s_ui.wifi_eap_cont, lv_pct(100));
+    lv_obj_set_height(s_ui.wifi_eap_cont, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(s_ui.wifi_eap_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_ui.wifi_eap_cont, 0, 0);
+    lv_obj_set_style_pad_all(s_ui.wifi_eap_cont, 0, 0);
+    lv_obj_set_style_pad_row(s_ui.wifi_eap_cont, 6, 0);
+    lv_obj_set_layout(s_ui.wifi_eap_cont, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(s_ui.wifi_eap_cont, LV_FLEX_FLOW_COLUMN);
+    if (!s_wifi_cfg.eap_enabled) {
+        lv_obj_add_flag(s_ui.wifi_eap_cont, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    s_ui.wifi_eap_identity_ta = lv_textarea_create(s_ui.wifi_eap_cont);
+    lv_obj_set_width(s_ui.wifi_eap_identity_ta, lv_pct(100));
+    lv_textarea_set_one_line(s_ui.wifi_eap_identity_ta, true);
+    lv_textarea_set_placeholder_text(s_ui.wifi_eap_identity_ta, "Aeussere Identitaet (z.B. anonymous@hsd.de)");
+    lv_textarea_set_text(s_ui.wifi_eap_identity_ta, s_wifi_cfg.eap_identity[0] ? s_wifi_cfg.eap_identity : "");
+    lv_obj_add_event_cb(s_ui.wifi_eap_identity_ta, textarea_focus_event_cb, LV_EVENT_FOCUSED, NULL);
+    lv_obj_add_event_cb(s_ui.wifi_eap_identity_ta, textarea_focus_event_cb, LV_EVENT_DEFOCUSED, NULL);
+
+    s_ui.wifi_eap_username_ta = lv_textarea_create(s_ui.wifi_eap_cont);
+    lv_obj_set_width(s_ui.wifi_eap_username_ta, lv_pct(100));
+    lv_textarea_set_one_line(s_ui.wifi_eap_username_ta, true);
+    lv_textarea_set_placeholder_text(s_ui.wifi_eap_username_ta, "Username (z.B. user@hsd.de)");
+    lv_textarea_set_text(s_ui.wifi_eap_username_ta, s_wifi_cfg.eap_username[0] ? s_wifi_cfg.eap_username : "");
+    lv_obj_add_event_cb(s_ui.wifi_eap_username_ta, textarea_focus_event_cb, LV_EVENT_FOCUSED, NULL);
+    lv_obj_add_event_cb(s_ui.wifi_eap_username_ta, textarea_focus_event_cb, LV_EVENT_DEFOCUSED, NULL);
     lv_obj_t *dhcp_row = lv_obj_create(s_ui.wifi_cfg_page);
     lv_obj_set_width(dhcp_row, lv_pct(100));
     lv_obj_set_height(dhcp_row, LV_SIZE_CONTENT);
@@ -2807,6 +3309,14 @@ static void create_ui(void)
     lv_obj_add_event_cb(s_ui.wifi_netmask_ta, textarea_focus_event_cb, LV_EVENT_FOCUSED, NULL);
     lv_obj_add_event_cb(s_ui.wifi_netmask_ta, textarea_focus_event_cb, LV_EVENT_DEFOCUSED, NULL);
 
+    s_ui.wifi_dns_ta = lv_textarea_create(s_ui.wifi_static_ip_cont);
+    lv_obj_set_width(s_ui.wifi_dns_ta, lv_pct(100));
+    lv_textarea_set_one_line(s_ui.wifi_dns_ta, true);
+    lv_textarea_set_placeholder_text(s_ui.wifi_dns_ta, "DNS-Server (z.B. 8.8.8.8, optional)");
+    lv_textarea_set_text(s_ui.wifi_dns_ta, s_wifi_cfg.dns[0] ? s_wifi_cfg.dns : "");
+    lv_obj_add_event_cb(s_ui.wifi_dns_ta, textarea_focus_event_cb, LV_EVENT_FOCUSED, NULL);
+    lv_obj_add_event_cb(s_ui.wifi_dns_ta, textarea_focus_event_cb, LV_EVENT_DEFOCUSED, NULL);
+
     lv_obj_t *wifi_apply_btn = create_primary_button(s_ui.wifi_cfg_page, "Speichern & Verbinden");
     lv_obj_add_event_cb(wifi_apply_btn, wifi_cfg_save_connect_event_cb, LV_EVENT_CLICKED, NULL);
 
@@ -2814,14 +3324,11 @@ static void create_ui(void)
     lv_obj_set_style_bg_color(wifi_to_status_btn, lv_color_hex(0x374151), 0);
     lv_obj_add_event_cb(wifi_to_status_btn, wifi_cfg_show_status_page, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *wifi_close_btn = create_primary_button(s_ui.wifi_cfg_page, "Schliessen");
-    lv_obj_set_style_bg_color(wifi_close_btn, lv_color_hex(0x374151), 0);
-    lv_obj_add_event_cb(wifi_close_btn, wifi_cfg_close_event_cb, LV_EVENT_CLICKED, NULL);
-
     /* --- Board status page (inside same modal) --- */
     s_ui.wifi_status_page = lv_obj_create(s_ui.wifi_cfg_modal);
     lv_obj_set_width(s_ui.wifi_status_page, lv_pct(100));
-    lv_obj_set_height(s_ui.wifi_status_page, LV_SIZE_CONTENT);
+    lv_obj_set_height(s_ui.wifi_status_page, 0);
+    lv_obj_set_flex_grow(s_ui.wifi_status_page, 1);
     lv_obj_set_style_bg_opa(s_ui.wifi_status_page, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_ui.wifi_status_page, 0, 0);
     lv_obj_set_style_pad_all(s_ui.wifi_status_page, 0, 0);
@@ -2881,26 +3388,49 @@ static void create_ui(void)
     lv_obj_center(tab_sys_lbl);
     lv_obj_add_event_cb(s_ui.tab_sys_btn, status_tab_system_cb, LV_EVENT_CLICKED, NULL);
 
+    /* Scrollbarer Inhaltsbereich fuer Tab-Content – Title und Tab-Leiste bleiben oben fixiert */
+    lv_obj_t *tab_scroll_area = lv_obj_create(s_ui.wifi_status_page);
+    lv_obj_set_width(tab_scroll_area, lv_pct(100));
+    lv_obj_set_height(tab_scroll_area, 0);
+    lv_obj_set_flex_grow(tab_scroll_area, 1);
+    lv_obj_set_style_bg_opa(tab_scroll_area, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tab_scroll_area, 0, 0);
+    lv_obj_set_style_pad_all(tab_scroll_area, 0, 0);
+    lv_obj_set_layout(tab_scroll_area, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(tab_scroll_area, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollbar_mode(tab_scroll_area, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_add_flag(tab_scroll_area, LV_OBJ_FLAG_SCROLLABLE);
+
     /* --- Network sub-tab --- */
-    s_ui.status_tab_net = lv_obj_create(s_ui.wifi_status_page);
+    s_ui.status_tab_net = lv_obj_create(tab_scroll_area);
     lv_obj_set_width(s_ui.status_tab_net, lv_pct(100));
     lv_obj_set_height(s_ui.status_tab_net, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(s_ui.status_tab_net, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_ui.status_tab_net, 0, 0);
     lv_obj_set_style_pad_all(s_ui.status_tab_net, 0, 0);
+    lv_obj_set_style_pad_row(s_ui.status_tab_net, 10, 0);
+    lv_obj_set_layout(s_ui.status_tab_net, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(s_ui.status_tab_net, LV_FLEX_FLOW_COLUMN);
 
     s_ui.status_net_label = lv_label_create(s_ui.status_tab_net);
     lv_label_set_text(s_ui.status_net_label, "Lade...");
     lv_obj_set_width(s_ui.status_net_label, lv_pct(100));
     lv_obj_set_style_text_color(s_ui.status_net_label, lv_color_hex(0xCBD5E1), 0);
 
+    lv_obj_t *net_to_wifi_btn = create_primary_button(s_ui.status_tab_net, "WLAN Konfiguration");
+    lv_obj_set_style_bg_color(net_to_wifi_btn, lv_color_hex(0x374151), 0);
+    lv_obj_add_event_cb(net_to_wifi_btn, wifi_cfg_show_wifi_page, LV_EVENT_CLICKED, NULL);
+
     /* --- Bridge sub-tab --- */
-    s_ui.status_tab_bridge = lv_obj_create(s_ui.wifi_status_page);
+    s_ui.status_tab_bridge = lv_obj_create(tab_scroll_area);
     lv_obj_set_width(s_ui.status_tab_bridge, lv_pct(100));
     lv_obj_set_height(s_ui.status_tab_bridge, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(s_ui.status_tab_bridge, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_ui.status_tab_bridge, 0, 0);
     lv_obj_set_style_pad_all(s_ui.status_tab_bridge, 0, 0);
+    lv_obj_set_style_pad_row(s_ui.status_tab_bridge, 10, 0);
+    lv_obj_set_layout(s_ui.status_tab_bridge, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(s_ui.status_tab_bridge, LV_FLEX_FLOW_COLUMN);
     lv_obj_add_flag(s_ui.status_tab_bridge, LV_OBJ_FLAG_HIDDEN);
 
     s_ui.status_bridge_label = lv_label_create(s_ui.status_tab_bridge);
@@ -2908,8 +3438,12 @@ static void create_ui(void)
     lv_obj_set_width(s_ui.status_bridge_label, lv_pct(100));
     lv_obj_set_style_text_color(s_ui.status_bridge_label, lv_color_hex(0xCBD5E1), 0);
 
+    s_ui.measure_idle_btn = create_primary_button(s_ui.status_tab_bridge, LV_SYMBOL_CHARGE " Idle-Strom messen");
+    lv_obj_set_style_bg_color(s_ui.measure_idle_btn, lv_color_hex(0x0F766E), 0);
+    lv_obj_add_event_cb(s_ui.measure_idle_btn, measure_idle_current_event_cb, LV_EVENT_CLICKED, NULL);
+
     /* --- System sub-tab --- */
-    s_ui.status_tab_system = lv_obj_create(s_ui.wifi_status_page);
+    s_ui.status_tab_system = lv_obj_create(tab_scroll_area);
     lv_obj_set_width(s_ui.status_tab_system, lv_pct(100));
     lv_obj_set_height(s_ui.status_tab_system, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(s_ui.status_tab_system, LV_OPA_TRANSP, 0);
@@ -2958,13 +3492,11 @@ static void create_ui(void)
     lv_obj_set_style_bg_color(s_ui.ota_btn, lv_color_hex(0x0F766E), 0);
     lv_obj_add_event_cb(s_ui.ota_btn, ota_check_event_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *status_to_wifi_btn = create_primary_button(s_ui.wifi_status_page, "WLAN Konfiguration");
-    lv_obj_set_style_bg_color(status_to_wifi_btn, lv_color_hex(0x374151), 0);
-    lv_obj_add_event_cb(status_to_wifi_btn, wifi_cfg_show_wifi_page, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *status_close_btn = create_primary_button(s_ui.wifi_status_page, "Schliessen");
-    lv_obj_set_style_bg_color(status_close_btn, lv_color_hex(0x374151), 0);
-    lv_obj_add_event_cb(status_close_btn, wifi_cfg_close_event_cb, LV_EVENT_CLICKED, NULL);
+    /* Schliessen-Button immer am unteren Rand des Modals (ausserhalb beider Pages) */
+    lv_obj_t *modal_close_btn = create_primary_button(s_ui.wifi_cfg_modal, "Schliessen");
+    lv_obj_set_style_bg_color(modal_close_btn, lv_color_hex(0x374151), 0);
+    lv_obj_set_style_margin_top(modal_close_btn, 8, 0);
+    lv_obj_add_event_cb(modal_close_btn, wifi_cfg_close_event_cb, LV_EVENT_CLICKED, NULL);
 
     s_ui.keyboard = lv_keyboard_create(screen);
     lv_obj_set_size(s_ui.keyboard, lv_pct(100), lv_pct(40));
@@ -3235,7 +3767,140 @@ static esp_err_t pn532_recover(void)
     vTaskDelay(pdMS_TO_TICKS(PN532_RECOVERY_DELAY_MS));
     return pn532_init();
 }
+#endif /* ENABLE_NFC */
 
+/* ════════════════════════════════════════════════════════════════════════════
+ * ADS1115 + PCF8574T – Sensor-Treiber
+ *
+ * ADS1115 (0x48): 16-Bit-ADC, 4 Single-Ended-Kanaele, PGA=±2.048 V, 128 SPS
+ *   Konfigurationsregister (0x01) wird pro Kanal mit Single-Shot-Befehl beschrieben.
+ *   Konversionsregister (0x00) wird nach ~15 ms gelesen.
+ *   Spannungsaufloesung: 1 LSB = 62.5 µV  →  mV = raw * 2048 / 32768
+ *
+ * PCF8574T (0x20): Quasi-bidirektionale I/Os.
+ *   Input:  0xFF schreiben (Port-Latch HIGH), dann 1 Byte lesen.
+ *   Output: Gewuenschten Byte-Wert direkt schreiben.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+static esp_err_t sensors_init(void)
+{
+    ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "sensors: I2C init failed");
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    ESP_RETURN_ON_FALSE(bus != NULL, ESP_ERR_INVALID_STATE, TAG, "sensors: I2C bus null");
+
+    /* ADS1115 */
+    if (s_ads1115_dev == NULL) {
+        i2c_device_config_t ads_cfg = {
+            .dev_addr_length  = I2C_ADDR_BIT_LEN_7,
+            .device_address   = ADS1115_I2C_ADDR,
+            .scl_speed_hz     = ADS1115_I2C_SCL_SPEED_HZ,
+        };
+        esp_err_t e = i2c_master_bus_add_device(bus, &ads_cfg, &s_ads1115_dev);
+        if (e == ESP_OK) {
+            ESP_LOGI(TAG, "ADS1115 init OK (0x%02X)", ADS1115_I2C_ADDR);
+        } else {
+            ESP_LOGW(TAG, "ADS1115 not found at 0x%02X: %s", ADS1115_I2C_ADDR, esp_err_to_name(e));
+            s_ads1115_dev = NULL;
+        }
+    }
+
+    /* PCF8574T */
+    if (s_pcf8574_dev == NULL) {
+        i2c_device_config_t pcf_cfg = {
+            .dev_addr_length  = I2C_ADDR_BIT_LEN_7,
+            .device_address   = PCF8574_I2C_ADDR,
+            .scl_speed_hz     = PCF8574_I2C_SCL_SPEED_HZ,
+        };
+        esp_err_t e = i2c_master_bus_add_device(bus, &pcf_cfg, &s_pcf8574_dev);
+        if (e == ESP_OK) {
+            ESP_LOGI(TAG, "PCF8574T init OK (0x%02X)", PCF8574_I2C_ADDR);
+            /* Ausgaenge initialisieren: alle aus (active LOW = 1), Eingaenge auf 1 */
+            uint8_t pcf_init = PCF_OUTPUT_MASK | PCF_INPUT_MASK;
+            i2c_master_transmit(s_pcf8574_dev, &pcf_init, 1, pdMS_TO_TICKS(20));
+            s_pcf_output = PCF_OUTPUT_MASK;
+        } else {
+            ESP_LOGW(TAG, "PCF8574T not found at 0x%02X: %s", PCF8574_I2C_ADDR, esp_err_to_name(e));
+            s_pcf8574_dev = NULL;
+        }
+    }
+
+    return ESP_OK;
+}
+
+/* Einen ADS1115-Kanal (0-3) einmalig im Single-Shot-Modus messen.
+ * Config MSB-Werte fuer AIN0-GND (0xC5), AIN1-GND (0xD5), AIN2-GND (0xE5), AIN3-GND (0xF5):
+ *   OS=1, MUX=1xx, PGA=010(±2.048V), MODE=1, DR=100(128SPS), COMP_QUE=11(disabled)  */
+static int16_t ads1115_read_channel(uint8_t ch)
+{
+    if (s_ads1115_dev == NULL || ch > 3) {
+        return 0;
+    }
+    static const uint8_t mux_msb[4] = {0xC5, 0xD5, 0xE5, 0xF5};
+
+    /* Konfigurationsregister schreiben → Konversion starten */
+    uint8_t cfg[3] = {0x01, mux_msb[ch], 0x83};
+    esp_err_t e = i2c_master_transmit(s_ads1115_dev, cfg, sizeof(cfg), pdMS_TO_TICKS(50));
+    if (e != ESP_OK) {
+        return 0;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(15)); /* 128 SPS → ~7.8 ms; 15 ms Sicherheitsmarge */
+
+    /* Auf Konversionsregister zeigen */
+    uint8_t reg = 0x00;
+    e = i2c_master_transmit(s_ads1115_dev, &reg, 1, pdMS_TO_TICKS(50));
+    if (e != ESP_OK) {
+        return 0;
+    }
+
+    /* 16-Bit-Ergebnis lesen */
+    uint8_t buf[2] = {0};
+    e = i2c_master_receive(s_ads1115_dev, buf, sizeof(buf), pdMS_TO_TICKS(50));
+    if (e != ESP_OK) {
+        return 0;
+    }
+    return (int16_t)((uint16_t)(buf[0] << 8) | buf[1]);
+}
+
+/* PCF8574T: gewuenschten Ausgangszustand schreiben (0=LOW, 1=HIGH/Input-floating) */
+static void pcf8574_write(uint8_t val)
+{
+    if (s_pcf8574_dev == NULL) {
+        return;
+    }
+    i2c_master_transmit(s_pcf8574_dev, &val, 1, pdMS_TO_TICKS(20));
+}
+
+/* Ausgangszustand P0-P3 setzen und senden; P4-P7 bleiben Eingaenge (1).
+ * active LOW: bit=0 → aktiv (LED/Relais an), bit=1 → inaktiv. */
+static void pcf8574_set_outputs(uint8_t outputs)
+{
+    s_pcf_output = outputs & PCF_OUTPUT_MASK;
+    pcf8574_write(s_pcf_output | PCF_INPUT_MASK);
+}
+
+/* Alle Sensoren lesen und in globale Cache-Variablen schreiben.
+ * Dauer: ~4 × 15 ms (ADS) + 2 ms (PCF) ≈ 62 ms → nur im Auth-Worker aufrufen. */
+static void sensors_read(void)
+{
+    if (s_ads1115_dev != NULL) {
+        for (int ch = 0; ch < 4; ch++) {
+            s_ads_raw[ch] = ads1115_read_channel((uint8_t)ch);
+        }
+    }
+    if (s_pcf8574_dev != NULL) {
+        /* Ausgaenge beibehalten, Eingaenge (P4-P7) fuer Lesevorgang auf 1 setzen */
+        pcf8574_write(s_pcf_output | PCF_INPUT_MASK);
+        vTaskDelay(pdMS_TO_TICKS(2));
+        uint8_t val = 0xFF;
+        esp_err_t e = i2c_master_receive(s_pcf8574_dev, &val, 1, pdMS_TO_TICKS(20));
+        if (e == ESP_OK) {
+            s_pcf_input = val & PCF_INPUT_MASK;  /* nur Eingangsbits (P4-P7) speichern */
+        }
+    }
+}
+
+#if ENABLE_NFC
 /* ════════════════════════════════════════════════════════════════════════════
  * NFC-Task: Core 0, kommuniziert direkt mit PN532 via I2C (Adresse 0x54).
  * Scannt per InListPassiveTarget, formatiert die UID und schickt Auth-Requests.
@@ -3415,6 +4080,7 @@ void app_main(void)
     ESP_ERROR_CHECK(err);
 
     i2c_scan_log();
+    sensors_init();  /* ADS1115 + PCF8574T initialisieren */
 
     /* PWRKEY (SYS_OUT) on GPIO 16: goes LOW when BAT_PWR button is pressed */
     {
@@ -3434,6 +4100,10 @@ void app_main(void)
     ESP_ERROR_CHECK(wifi_cfg_load(&s_wifi_cfg));
     ESP_ERROR_CHECK(auth_cfg_load(&s_auth_cfg));
     ESP_ERROR_CHECK(bridge_cfg_load(&s_bridge_cfg));
+    /* Gespeicherten Messwert nach Neustart wiederherstellen */
+    if (s_bridge_cfg.idle_current > 0.0f) {
+        s_idle_current_measured_mV = s_bridge_cfg.idle_current;
+    }
     if (s_auth_cfg.mac[0] == '\0') {
         if (get_device_mac_text(s_auth_cfg.mac, sizeof(s_auth_cfg.mac)) == ESP_OK) {
             auth_cfg_save(&s_auth_cfg);
