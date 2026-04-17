@@ -6,3 +6,6 @@ idf_component_register(
 
 # APP_VERSION als C-Präprozessor-Define aus PROJECT_VER (CMakeLists.txt root)
 target_compile_definitions(${COMPONENT_LIB} PRIVATE APP_VERSION="${PROJECT_VER}")
+
+# HSD-Logo: vorgeneriertes C-Array direkt einbinden (via LVGLImage.py, ARGB8888)
+lvgl_port_add_images(${COMPONENT_LIB} "images/")

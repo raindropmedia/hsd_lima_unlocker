@@ -29,7 +29,7 @@
 #   GET      /                           - Admin-Dashboard (HTML)
 # ============================================================================
 
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response
 import base64
 import hashlib
 import io
@@ -66,6 +66,32 @@ TOKEN_BYTES = 24
 LOGIN_OTP_TTL_MINUTES = 5
 PIN_TTL_MINUTES = 5
 OPENID_FORWARD_URL = os.getenv('OPENID_FORWARD_URL', '').strip()
+
+ADMIN_PASSWORD = os.getenv('LIMA_ADMIN_PASSWORD', 'L1Ma')
+
+
+def _check_admin_auth():
+    """Gibt None zurück wenn Auth OK, sonst eine 401-Response."""
+    auth = request.authorization
+    if auth and auth.password == ADMIN_PASSWORD:
+        return None
+    return Response(
+        'Zugang verweigert',
+        401,
+        {'WWW-Authenticate': 'Basic realm="LiMa Admin"'}
+    )
+
+
+def admin_required(f):
+    """Decorator: schützt Admin-Routen mit HTTP Basic Auth."""
+    from functools import wraps
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        err = _check_admin_auth()
+        if err is not None:
+            return err
+        return f(*args, **kwargs)
+    return decorated
 
 
 def localtime_iso():
@@ -1253,6 +1279,7 @@ def otp_verify():
 
     # Admin: Gibt alle User zurück (ohne Passwort-Hash)
 @app.route('/api/admin/users', methods=['GET'])
+@admin_required
 def admin_get_users():
     rows = [dict(row) for row in list_users()]
     for row in rows:
@@ -1264,6 +1291,7 @@ def admin_get_users():
 
     # Admin: Speichert User (neu oder Update), prüft UID-Konflikte
 @app.route('/api/admin/users/save', methods=['POST'])
+@admin_required
 def admin_save_user():
     data, error_response = get_json_with_logging('ADMIN_USER_SAVE')
     if error_response is not None:
@@ -1341,6 +1369,7 @@ def admin_save_user():
 
     # Admin: Löscht User und entfernt Zuordnung in Clients
 @app.route('/api/admin/users/delete', methods=['POST'])
+@admin_required
 def admin_delete_user():
     data, error_response = get_json_with_logging('ADMIN_USER_DELETE')
     if error_response is not None:
@@ -1364,6 +1393,7 @@ def admin_delete_user():
     # Admin: Gibt alle Clients/Bridges zurück
 @app.route('/api/admin/clients', methods=['GET'])
 @app.route('/api/admin/bridges', methods=['GET'])
+@admin_required
 def admin_get_clients():
     rows = [dict(row) for row in list_clients()]
     return jsonify({'valid': True, 'clients': rows})
@@ -1372,6 +1402,7 @@ def admin_get_clients():
     # Admin: Speichert Client/Bridge (neu oder Update)
 @app.route('/api/admin/clients/save', methods=['POST'])
 @app.route('/api/admin/bridges/save', methods=['POST'])
+@admin_required
 def admin_save_client():
     data, error_response = get_json_with_logging('ADMIN_CLIENT_SAVE')
     if error_response is not None:
@@ -1418,6 +1449,7 @@ def admin_save_client():
     # Admin: Löscht Client/Bridge
 @app.route('/api/admin/clients/delete', methods=['POST'])
 @app.route('/api/admin/bridges/delete', methods=['POST'])
+@admin_required
 def admin_delete_client():
     data, error_response = get_json_with_logging('ADMIN_CLIENT_DELETE')
     if error_response is not None:
@@ -1436,6 +1468,7 @@ def admin_delete_client():
 
     # Admin: Gibt alle Bridge-Konfigurationen zurück
 @app.route('/api/admin/bridge_config', methods=['GET'])
+@admin_required
 def admin_get_bridge_configs():
     configs = [dict(row) for row in list_bridge_configs()]
     return jsonify({'valid': True, 'configs': configs})
@@ -1443,6 +1476,7 @@ def admin_get_bridge_configs():
 
     # Admin: Speichert Bridge-Konfiguration (neu oder Update)
 @app.route('/api/admin/bridge_config/save', methods=['POST'])
+@admin_required
 def admin_save_bridge_config():
     data, error_response = get_json_with_logging('ADMIN_BRIDGE_CONFIG_SAVE')
     if error_response is not None:
@@ -1488,6 +1522,7 @@ def admin_save_bridge_config():
 
     # Admin: Löscht Bridge-Konfiguration
 @app.route('/api/admin/bridge_config/delete', methods=['POST'])
+@admin_required
 def admin_delete_bridge_config():
     data, error_response = get_json_with_logging('ADMIN_BRIDGE_CONFIG_DELETE')
     if error_response is not None:
@@ -1506,6 +1541,7 @@ def admin_delete_bridge_config():
 
     # Admin: Simuliert Mail-OTP-Versand für User/Client
 @app.route('/api/admin/mail/send', methods=['POST'])
+@admin_required
 def admin_simulate_mail_send():
     data, error_response = get_json_with_logging('ADMIN_MAIL_SEND')
     if error_response is not None:
@@ -1529,6 +1565,7 @@ def admin_simulate_mail_send():
 
     # Admin: Gibt Mail-OTP-Log zurück
 @app.route('/api/admin/mail', methods=['GET'])
+@admin_required
 def admin_get_mail_log():
     rows = [dict(row) for row in list_mail_otp_log(limit=100)]
     return jsonify({'valid': True, 'mail_otps': rows})
@@ -1536,6 +1573,7 @@ def admin_get_mail_log():
 
     # Admin: Startet TOTP-Setup für User (gibt Secret und QR zurück)
 @app.route('/api/admin/totp/setup', methods=['POST'])
+@admin_required
 def admin_totp_setup():
     if pyotp is None:
         return jsonify({'valid': False, 'error': 'pyotp nicht installiert'}), 503
@@ -1569,6 +1607,7 @@ def admin_totp_setup():
 
     # Admin: Bestätigt TOTP-Setup mit Code, speichert Secret
 @app.route('/api/admin/totp/confirm', methods=['POST'])
+@admin_required
 def admin_totp_confirm():
     if pyotp is None:
         return jsonify({'valid': False, 'error': 'pyotp nicht installiert'}), 503
@@ -1609,6 +1648,7 @@ def admin_totp_confirm():
 
     # Admin: Entfernt TOTP-Secret für User
 @app.route('/api/admin/totp/remove', methods=['POST'])
+@admin_required
 def admin_totp_remove():
     data, error_response = get_json_with_logging('ADMIN_TOTP_REMOVE')
     if error_response is not None:
@@ -1632,6 +1672,7 @@ def admin_totp_remove():
 
     # Admin: Gibt Unlock-Log zurück (letzte Freischaltungen)
 @app.route('/api/admin/unlock_log', methods=['GET'])
+@admin_required
 def admin_unlock_log():
     rows = list_unlock_log()
     return jsonify([dict(r) for r in rows])
@@ -1706,6 +1747,7 @@ def hsd_ota_firmware():
 
 
 @app.route('/api/admin/ota/upload', methods=['POST'])
+@admin_required
 def admin_ota_upload():
     # Admin lädt neue Firmware hoch (.bin, Versionsnummer optional – wird aus Binary gelesen)
     if 'firmware' not in request.files:
@@ -1743,6 +1785,7 @@ def admin_ota_upload():
 
 
 @app.route('/api/admin/ota/info', methods=['GET'])
+@admin_required
 def admin_ota_info():
     # Gibt Info über aktuell gespeicherte Firmware zurück
     if os.path.exists(OTA_VERSION_FILE) and os.path.exists(OTA_FIRMWARE_FILE):
@@ -1764,6 +1807,7 @@ def admin_ota_info():
 
     # Dashboard: HTML-Frontend für Status und Verwaltung
 @app.route('/')
+@admin_required
 def dashboard():
     openid_value = OPENID_FORWARD_URL or '(nicht gesetzt - lokale Auth)'
 

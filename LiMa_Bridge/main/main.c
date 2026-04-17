@@ -62,6 +62,8 @@
 
 /* APP_VERSION wird per target_compile_definitions aus PROJECT_VER (root CMakeLists.txt) gesetzt */
 
+LV_IMG_DECLARE(hsd_logo);
+
 #if ENABLE_NFC
 #define PN532_I2C_ADDR        0x54
 #define PN532_UID_MAX_LEN     10
@@ -868,7 +870,7 @@ static bool enqueue_token_check_request_if_needed(void)
     }
 
     set_auth_busy(true);
-    set_status_text("Token wird geprueft...", lv_color_hex(0x93C5FD));
+    set_status_text("Token wird geprüft...", lv_color_hex(0x93C5FD));
     return true;
 }
 
@@ -1048,7 +1050,6 @@ static bool extract_json_string(const char *resp, const char *key, char *out, si
     const char *start = NULL;
     const char *cursor = NULL;
     const char *end = NULL;
-    size_t len = 0;
 
     if ((resp == NULL) || (key == NULL) || (out == NULL) || (out_size < 2)) {
         return false;
@@ -1080,14 +1081,52 @@ static bool extract_json_string(const char *resp, const char *key, char *out, si
         return false;
     }
 
-    len = (size_t)(end - start);
-    if (len >= out_size) {
-        len = out_size - 1;
+    /* Decode JSON string: handle \uXXXX escapes (e.g. German umlauts ä=\u00e4)
+     * and standard escape sequences. Plain UTF-8 bytes are copied as-is. */
+    const char *src = start;
+    size_t written = 0;
+    while (src < end && written < out_size - 1) {
+        if (*src == '\\' && (src + 1) < end) {
+            src++;
+            if (*src == 'u' && (src + 5) <= end) {
+                /* Parse 4 hex digits after \u */
+                char hex[5] = {src[1], src[2], src[3], src[4], '\0'};
+                unsigned long cp = strtoul(hex, NULL, 16);
+                src += 5;
+                /* Encode Unicode codepoint as UTF-8 */
+                if (cp < 0x80U) {
+                    out[written++] = (char)cp;
+                } else if (cp < 0x800U) {
+                    if (written + 1 < out_size - 1) {
+                        out[written++] = (char)(0xC0U | (cp >> 6));
+                        out[written++] = (char)(0x80U | (cp & 0x3FU));
+                    }
+                } else {
+                    if (written + 2 < out_size - 1) {
+                        out[written++] = (char)(0xE0U | (cp >> 12));
+                        out[written++] = (char)(0x80U | ((cp >> 6) & 0x3FU));
+                        out[written++] = (char)(0x80U | (cp & 0x3FU));
+                    }
+                }
+            } else {
+                /* Standard JSON escape sequences */
+                switch (*src) {
+                    case 'n':  out[written++] = '\n'; break;
+                    case 't':  out[written++] = '\t'; break;
+                    case 'r':  out[written++] = '\r'; break;
+                    case '\\': out[written++] = '\\'; break;
+                    case '"':  out[written++] = '"';  break;
+                    case '/':  out[written++] = '/';  break;
+                    default:   out[written++] = *src; break;
+                }
+                src++;
+            }
+        } else {
+            out[written++] = *src++;
+        }
     }
-
-    memcpy(out, start, len);
-    out[len] = '\0';
-    return len > 0;
+    out[written] = '\0';
+    return written > 0;
 }
 
 /* Boolean-Wert aus JSON-Antwort extrahieren (true/false) */
@@ -1526,7 +1565,7 @@ static void auth_result_timer_cb(lv_timer_t *timer)
             if (res.success) {
                 if (s_bridge_cfg.config_version > 0) {
                     ESP_LOGI(TAG, "Heartbeat OK (konfiguriert)");
-                    set_status_text("Token gueltig", lv_color_hex(0x86EFAC));
+                    set_status_text("Token gültig", lv_color_hex(0x86EFAC));
                 } else {
                     ESP_LOGI(TAG, "Heartbeat OK (unkonfiguriert)");
                     set_status_text("Registriert, unkonfiguriert", lv_color_hex(0xFDE68A));
@@ -1541,7 +1580,7 @@ static void auth_result_timer_cb(lv_timer_t *timer)
                 auth_cfg_save(&s_auth_cfg);
                 s_setup_log_verbose = true;
                 s_setup_last_attempt_us = 0;
-                set_status_text("Token ungueltig, registriere neu...", lv_color_hex(0xFCA5A5));
+                set_status_text("Token ungültig, registriere neu...", lv_color_hex(0xFCA5A5));
                 enqueue_setup_request_if_needed();
             } else if (server_unreachable) {
                 ESP_LOGW(TAG, "Heartbeat: server unreachable");
@@ -1673,7 +1712,7 @@ static void pin_submit_event_cb(lv_event_t *event)
     }
 
     if (!auth_has_token()) {
-        set_status_text("Geraet noch nicht registriert", lv_color_hex(0xFCA5A5));
+        set_status_text("Gerät noch nicht registriert", lv_color_hex(0xFCA5A5));
         return;
     }
 
@@ -1694,7 +1733,7 @@ static void pin_submit_event_cb(lv_event_t *event)
     }
 
     set_auth_busy(true);
-    set_status_text("Code wird geprueft...", lv_color_hex(0xFDE68A));
+    set_status_text("Code wird geprüft...", lv_color_hex(0xFDE68A));
 }
 
 /* Numpad-Tasten verarbeiten: Ziffern, Löschen (CLR), OK → Submit */
@@ -1790,7 +1829,7 @@ static void sim_nfc_event_cb(lv_event_t *event)
     const char *uid = (const char *)lv_event_get_user_data(event);
     if (!uid || s_auth_busy || !auth_has_token()) {
         if (!auth_has_token()) {
-            set_status_text("Geraet noch nicht registriert", lv_color_hex(0xFCA5A5));
+            set_status_text("Gerät noch nicht registriert", lv_color_hex(0xFCA5A5));
         }
         return;
     }
@@ -1832,7 +1871,7 @@ static void login_submit_event_cb(lv_event_t *event)
     }
 
     if (!auth_has_token()) {
-        set_status_text("Geraet noch nicht registriert", lv_color_hex(0xFCA5A5));
+        set_status_text("Gerät noch nicht registriert", lv_color_hex(0xFCA5A5));
         return;
     }
 
@@ -1856,7 +1895,7 @@ static void login_submit_event_cb(lv_event_t *event)
     }
 
     set_auth_busy(true);
-    set_status_text("Login wird geprueft...", lv_color_hex(0xFDE68A));
+    set_status_text("Login wird geprüft...", lv_color_hex(0xFDE68A));
     login_close_event_cb(NULL);
 }
 
@@ -2214,13 +2253,13 @@ static void wifi_cfg_save_connect_event_cb(lv_event_t *event)
     s_wifi_cfg.eap_enabled = eap ? 1 : 0;
     if (eap) {
         if (s_wifi_cfg.password[0] == '\0') {
-            set_wifi_cfg_status_text("Passwort fuer Enterprise benoetigt", lv_color_hex(0xFCA5A5));
+            set_wifi_cfg_status_text("Passwort für Enterprise benötigt", lv_color_hex(0xFCA5A5));
             return;
         }
         const char *identity_text = lv_textarea_get_text(s_ui.wifi_eap_identity_ta);
         const char *username_text = lv_textarea_get_text(s_ui.wifi_eap_username_ta);
         if (username_text[0] == '\0') {
-            set_wifi_cfg_status_text("Username benoetigt", lv_color_hex(0xFCA5A5));
+            set_wifi_cfg_status_text("Username benötigt", lv_color_hex(0xFCA5A5));
             return;
         }
         strncpy(s_wifi_cfg.eap_identity, identity_text, sizeof(s_wifi_cfg.eap_identity) - 1);
@@ -2242,7 +2281,7 @@ static void wifi_cfg_save_connect_event_cb(lv_event_t *event)
 
         ip4_addr_t tmp = {0};
         if (!parse_ipv4(ip_text, &tmp) || !parse_ipv4(gw_text, &tmp) || !parse_ipv4(nm_text, &tmp)) {
-            set_wifi_cfg_status_text("Ungueltige IP-Adresse", lv_color_hex(0xFCA5A5));
+            set_wifi_cfg_status_text("Ungültige IP-Adresse", lv_color_hex(0xFCA5A5));
             return;
         }
 
@@ -2258,7 +2297,7 @@ static void wifi_cfg_save_connect_event_cb(lv_event_t *event)
         if (dns_text[0] != '\0') {
             ip4_addr_t dns_tmp = {0};
             if (!parse_ipv4(dns_text, &dns_tmp)) {
-                set_wifi_cfg_status_text("Ungueltige DNS-Adresse", lv_color_hex(0xFCA5A5));
+                set_wifi_cfg_status_text("Ungültige DNS-Adresse", lv_color_hex(0xFCA5A5));
                 return;
             }
             strncpy(s_wifi_cfg.dns, dns_text, sizeof(s_wifi_cfg.dns) - 1);
@@ -2860,22 +2899,44 @@ static void create_ui(void)
     lv_obj_set_scrollbar_mode(s_ui.start_container, LV_SCROLLBAR_MODE_OFF);
     lv_obj_clear_flag(s_ui.start_container, LV_OBJ_FLAG_SCROLLABLE);
 
+    /* HSD Logo — über dem Maschinennamen */
+    lv_obj_t *hsd_logo_img = lv_image_create(s_ui.start_container);
+    lv_image_set_src(hsd_logo_img, &hsd_logo);
+    lv_obj_set_width(hsd_logo_img, LV_SIZE_CONTENT);
+    lv_obj_set_height(hsd_logo_img, LV_SIZE_CONTENT);
+    lv_obj_set_align(hsd_logo_img, LV_ALIGN_TOP_LEFT);
+
     /* Machine name (large) */
     s_ui.machine_name_label = lv_label_create(s_ui.start_container);
     lv_label_set_text(s_ui.machine_name_label, "");
-    lv_obj_set_style_text_font(s_ui.machine_name_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(s_ui.machine_name_label, &lv_font_montserrat_30, 0);
     lv_obj_set_style_text_color(s_ui.machine_name_label, lv_color_hex(0xF9FAFB), 0);
     lv_obj_add_flag(s_ui.machine_name_label, LV_OBJ_FLAG_HIDDEN);
 
     /* Location */
     s_ui.location_label = lv_label_create(s_ui.start_container);
     lv_label_set_text(s_ui.location_label, "");
+    lv_obj_set_style_text_font(s_ui.location_label, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(s_ui.location_label, lv_color_hex(0xCBD5E1), 0);
     lv_obj_add_flag(s_ui.location_label, LV_OBJ_FLAG_HIDDEN);
 
-    /* QR code */
+    /* QR-Code + Status-Infos nebeneinander (QR links, Texte rechts) */
+    lv_obj_t *info_row = lv_obj_create(s_ui.start_container);
+    lv_obj_set_width(info_row, lv_pct(100));
+    lv_obj_set_height(info_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(info_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(info_row, 0, 0);
+    lv_obj_set_style_pad_all(info_row, 0, 0);
+    lv_obj_set_style_pad_column(info_row, 12, 0);
+    lv_obj_set_layout(info_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(info_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(info_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_scrollbar_mode(info_row, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(info_row, LV_OBJ_FLAG_SCROLLABLE);
+
 #if LV_USE_QRCODE
-    s_ui.qr_code = lv_qrcode_create(s_ui.start_container);
+    /* QR-Code (links) */
+    s_ui.qr_code = lv_qrcode_create(info_row);
     lv_qrcode_set_size(s_ui.qr_code, 120);
     lv_qrcode_set_dark_color(s_ui.qr_code, lv_color_hex(0x000000));
     lv_qrcode_set_light_color(s_ui.qr_code, lv_color_hex(0xFFFFFF));
@@ -2884,23 +2945,44 @@ static void create_ui(void)
     lv_obj_add_flag(s_ui.qr_code, LV_OBJ_FLAG_HIDDEN);
 #endif
 
-    lv_obj_t *title = lv_label_create(s_ui.start_container);
+    /* Textspalte (rechts neben QR-Code) */
+    lv_obj_t *info_col = lv_obj_create(info_row);
+    lv_obj_set_flex_grow(info_col, 1);
+    lv_obj_set_height(info_col, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(info_col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(info_col, 0, 0);
+    lv_obj_set_style_pad_all(info_col, 0, 0);
+    lv_obj_set_style_pad_row(info_col, 6, 0);
+    lv_obj_set_layout(info_col, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(info_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollbar_mode(info_col, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(info_col, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(info_col);
     lv_label_set_text(title, "Bitte HSD Karte anlegen");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0xF9FAFB), 0);
+    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(title, lv_pct(100));
 
-    lv_obj_t *hint = lv_label_create(s_ui.start_container);
+    lv_obj_t *hint = lv_label_create(info_col);
     lv_label_set_text(hint, "oder HSD Login verwenden.");
     lv_obj_set_style_text_color(hint, lv_color_hex(0xCBD5E1), 0);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, lv_pct(100));
 
-    s_ui.status_label = lv_label_create(s_ui.start_container);
+    s_ui.status_label = lv_label_create(info_col);
     lv_label_set_text(s_ui.status_label, "Bitte HSD Karte anlegen");
     lv_obj_set_style_text_color(s_ui.status_label, lv_color_hex(0x93C5FD), 0);
+    lv_label_set_long_mode(s_ui.status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_ui.status_label, lv_pct(100));
 
 #if ENABLE_NFC
-    s_ui.nfc_uid_label = lv_label_create(s_ui.start_container);
+    s_ui.nfc_uid_label = lv_label_create(info_col);
     lv_label_set_text(s_ui.nfc_uid_label, "NFC UID: -");
     lv_obj_set_style_text_color(s_ui.nfc_uid_label, lv_color_hex(0x86EFAC), 0);
+    lv_label_set_long_mode(s_ui.nfc_uid_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_ui.nfc_uid_label, lv_pct(100));
 #endif
 
     s_ui.login_btn = create_primary_button(s_ui.start_container, "HSD Login");
@@ -3009,12 +3091,12 @@ static void create_ui(void)
     lv_obj_set_style_bg_opa(pin_btn_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(pin_btn_row, 0, 0);
 
-    lv_obj_t *pin_back_btn = create_primary_button(pin_btn_row, "Zurueck");
+    lv_obj_t *pin_back_btn = create_primary_button(pin_btn_row, "Zurück");
     lv_obj_set_flex_grow(pin_back_btn, 1);
     lv_obj_set_style_bg_color(pin_back_btn, lv_color_hex(0x374151), 0);
     lv_obj_add_event_cb(pin_back_btn, back_to_start_event_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *pin_submit_btn = create_primary_button(pin_btn_row, "Code pruefen");
+    lv_obj_t *pin_submit_btn = create_primary_button(pin_btn_row, "Code prüfen");
     lv_obj_set_flex_grow(pin_submit_btn, 1);
     lv_obj_add_event_cb(pin_submit_btn, pin_submit_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(pin_back_btn, back_to_start_event_cb, LV_EVENT_CLICKED, NULL);
@@ -3040,7 +3122,7 @@ static void create_ui(void)
     lv_label_set_text(s_ui.result_text_label, "Freigeschaltet");
     lv_obj_set_style_text_font(s_ui.result_text_label, &lv_font_montserrat_20, 0);
 
-    lv_obj_t *result_back_btn = create_primary_button(s_ui.result_container, "Zurueck");
+    lv_obj_t *result_back_btn = create_primary_button(s_ui.result_container, "Zurück");
     lv_obj_set_style_bg_color(result_back_btn, lv_color_hex(0x374151), 0);
     lv_obj_add_event_cb(result_back_btn, back_to_start_event_cb, LV_EVENT_CLICKED, NULL);
 
@@ -3484,7 +3566,7 @@ static void create_ui(void)
     lv_obj_set_width(ota_sep, lv_pct(100));
 
     s_ui.ota_status_label = lv_label_create(s_ui.status_tab_system);
-    lv_label_set_text(s_ui.ota_status_label, "v" APP_VERSION " - Auf Update pruefen");
+    lv_label_set_text(s_ui.ota_status_label, "v" APP_VERSION " - Auf Update prüfen");
     lv_obj_set_style_text_color(s_ui.ota_status_label, lv_color_hex(0x93C5FD), 0);
     lv_obj_set_width(s_ui.ota_status_label, lv_pct(100));
 
@@ -4045,7 +4127,7 @@ static void nfc_task(void *arg)
                     bsp_display_unlock();
                 }
             } else {
-                set_status_text("Karte wird geprueft...", lv_color_hex(0xFDE68A));
+                set_status_text("Karte wird geprüft...", lv_color_hex(0xFDE68A));
             }
         }
 
