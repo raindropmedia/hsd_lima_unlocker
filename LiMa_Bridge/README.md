@@ -1,13 +1,14 @@
 # LiMa Bridge – ESP32-S3 Firmware
 
-**Version 1.0.3**
+**Version 1.0.7**
 
 Firmware für das **LiMa (Lernen im Makerspace) Bridge**-Gerät, das auf einem **Waveshare ESP32-S3 Touch LCD 4** (480×480 Touchscreen) läuft. Es dient als NFC-basiertes Authentifizierungsterminal für Maschinenfreischaltungen an der HSD (Hochschule Düsseldorf).
 
 ## Funktionsübersicht
 
 ### Authentifizierung
-- **NFC-Karte**: PN532-Reader (I2C) liest die UID und prüft sie gegen den Server
+- **NFC-Karte**: PN532-Reader (I2C, Adresse 0x54) liest die UID und prüft sie gegen den Server
+- **SuperUser**: Bis zu 32 NFC-UIDs können serverseitig als SuperUser hinterlegt werden – diese schalten die Maschine direkt ohne Netzwerk-Roundtrip frei
 - **Login**: E-Mail/Passwort-Eingabe über Touchscreen-GUI
 - **OTP**: Zweiter Faktor via TOTP (Authenticator-App) oder Mail-OTP (6-stelliger Code)
 - **Karten-Registrierung**: Nach erfolgreichem Login kann eine neue NFC-Karte mit dem Benutzerkonto verknüpft werden
@@ -17,24 +18,27 @@ Firmware für das **LiMa (Lernen im Makerspace) Bridge**-Gerät, das auf einem *
 - Visuelle Statusanzeige: Grün (aktiv), Gelb blinkend (<2 Min.), Rot (gesperrt)
 - Freischaltung manuell widerrufbar über Touchscreen
 - Timer-Reset per Tap auf den Statusindikator
+- **Idle-basiertes Abschalten**: Wenn nach Timer-Ablauf der gemessene Strom unter die konfigurierte Idle-Schwelle fällt und dort bleibt (Wartezeit `idle_shutdown_delay_s`), schaltet das Relais automatisch ab
 
 ### Kommunikation
 - HTTPS-Verbindung zum LiMa Server (`lima.hsd.pub`) mit Let's-Encrypt-Zertifikat
 - Periodischer Heartbeat (5 Min. konfiguriert / 1 Min. unkonfiguriert)
-- Bridge-Konfiguration (Name, Standort, Idle-Strom, OTP-Pflicht etc.) wird vom Server synchronisiert (Config-Versioning)
-- Sofortiger Heartbeat nach Idle-Strommessung oder Statusänderungen
-- OTA-Firmware-Updates (manuell und automatisch per `auto_ota`-Flag)
+- Bridge-Konfiguration (Name, Standort, Idle-Strom, OTP-Pflicht, SuperUser-UIDs usw.) wird vom Server synchronisiert (Config-Versioning)
+- Heartbeat-Antwort enthält nächste Reservierung (Name, Start, Ende) – wird als Banner auf der Startseite angezeigt
+- OTA-Firmware-Updates (manuell über GUI und automatisch per `auto_ota`-Flag)
 
 ### Sensorik & Peripherie
-- **ADS1115** (I2C, 0x48): 16-Bit ADC, 4 Kanäle – Strommessung am Maschinenausgang
+- **ADS1115** (I2C, 0x48): 16-Bit ADC, 4 Kanäle – kontinuierliche Strommessung am Maschinenausgang (RMS über 128 Samples)
+- **MCS1806**: Stromsensor ±20A, Empfindlichkeit 66 mV/A, Ruhespannung 1650 mV (VCC/2 bei 3,3 V)
+- **Kalibrierter Nullpunkt**: Einmalige Nullpunkt-Kalibrierung über GUI, Ergebnis persistent in NVS (`zero_cal_mv`), unabhängig von der Config-Versionierung
+- **Idle-Strom-Messung**: Einmalige Messung über GUI speichert den gemessenen Strom-Ruhewert im NVS und überträgt ihn per Heartbeat zum Server
 - **PCF8574T** (I2C, 0x20): 8-Bit I/O-Expander – Rote/Grüne LED, Relais (P0–P3), digitale Eingänge (P4–P7)
-- **Idle-Strom-Messung**: 5-fach Messung mit Trimmed Mean, Ergebnis in mV, wird per Heartbeat zum Server übertragen und im NVS persistent gespeichert
 
 ### GUI (LVGL 9)
-- **Startseite**: Maschinenname, Standort, QR-Code (Info-URL), Freischalt-Status, NFC-UID, Login-/Revoke-Button
+- **Startseite**: Maschinenname, Standort, QR-Code (Info-URL), Freischalt-Status, NFC-UID, Login-/Revoke-Button, Reservierungs-Banner
 - **PIN-Eingabe**: 6-stelliges Num-Pad für OTP-Codes
 - **Ergebnisseite**: Erfolg/Fehler-Anzeige mit Auto-Return (60 s) und Karten-Registrierungsoption
-- **Board-Status-Modal** (PWRKEY): Tab-basierte Übersicht – Netzwerk, Bridge, System/Debug; enthält WLAN-Konfiguration und Idle-Strom-Messung
+- **Board-Status-Modal** (PWRKEY): Tab-basierte Übersicht – Netzwerk, Bridge, System/Debug, Kalibrierung; enthält WLAN-Konfiguration, Idle-Strom-Messung und Nullpunkt-Kalibrierung
 - **Login-Modal**: E-Mail/Passwort-Formular mit WLAN-Keyboard
 - **Debug-Overlay**: Schalter für Log-Label, OTA-Trigger-Button
 
@@ -66,10 +70,18 @@ Firmware für das **LiMa (Lernen im Makerspace) Bridge**-Gerät, das auf einem *
                                show_view(PIN) /
                                activate_unlock()
 
-    Idle-Strom-Messung (bei Bedarf):
-    measure_idle_current_event_cb → idle_measure_task (Core 1)
-      → ADS1115 ch0, 5× Single-Shot → Trimmed Mean → mV
+    Strom-Messung (kontinuierlich, Core 0):
+    current_measure_task → ADS1115 ch0, kontinuierlicher Modus
+      → 128 Samples → RMS → s_current_rms_a [A]
+      → Idle-Erkennung: s_unlock_idle_pending + s_idle_below_since_us
+
+    Idle-Strom-Messung (einmalig, auf Anfrage aus GUI):
+    measure_idle_btn → idle_measure_task (Core 1)
       → s_bridge_cfg.idle_current (NVS) + Heartbeat-Payload
+
+    Nullpunkt-Kalibrierung (einmalig, auf Anfrage aus GUI):
+    calibrate_zero_btn → zero_cal_save() → NVS "zero_cal_mv"
+      → s_current_zero_mv (globaler Nullpunkt für RMS-Berechnung)
 ```
 
 ### Task-Verteilung
@@ -78,25 +90,32 @@ Firmware für das **LiMa (Lernen im Makerspace) Bridge**-Gerät, das auf einem *
 | LVGL / Display | 1 | GUI-Rendering, Timer-Callbacks |
 | Auth-Worker | 1 | HTTPS-Requests, JSON-Parsing, Config-Sync |
 | NFC-Polling | 0 | PN532-Kommunikation, UID-Erkennung |
-| Idle-Measure (einmalig) | 1 | ADS1115-Messung, NVS-Speicherung |
-| OTA-Task (einmalig) | 1 | Firmware-Download und Flash |
+| Strom-Messung | 0 | Kontinuierliche ADS1115-RMS-Messung, Idle-Erkennung |
+| Idle-Measure (einmalig) | 1 | ADS1115-Einzelmessung, NVS-Speicherung |
+| Auto-OTA (einmalig) | 1 | Firmware-Download und Flash |
 
 ### Datenfluss (Authentifizierung)
 1. NFC-Karte erkannt → `auth_request_t` mit UID in Request-Queue
-2. Auth-Worker → HTTPS POST `/api/hsd/nfc`
-3. Server antwortet mit `valid`, `pin_required`, `unlock_duration`
-4. Auth-Result-Timer:
+2. Auth-Worker prüft zuerst lokal gegen `superuser_uids` – direktes Unlock ohne Server möglich
+3. Sonst HTTPS POST `/api/hsd/nfc`
+4. Server antwortet mit `valid`, `pin_required`, `unlock_duration`
+5. Auth-Result-Timer:
    - Direkt freigeschaltet → `activate_unlock()` + Ergebnisseite
    - OTP erforderlich → PIN-Eingabeseite
    - Abgelehnt → Fehlermeldung
 
-### Datenfluss (Idle-Strom)
+### Datenfluss (Idle-Erkennung)
+1. `current_measure_task` misst kontinuierlich ADS1115 ch0 (RMS, 128 Samples)
+2. Nach Ablauf des Freischalt-Timers: `s_unlock_idle_pending = true`, Relais bleibt aktiv
+3. Strom bleibt unter `s_bridge_cfg.idle_current` → `s_idle_below_since_us` gesetzt
+4. Nach `idle_shutdown_delay_s` Sekunden kontinuierlich unter Schwelle → Relais abschalten
+
+### Datenfluss (Idle-Strom-Messung)
 1. Nutzer tippt „Idle-Strom messen" im Bridge-Tab
-2. `idle_measure_task` misst 5× ADS1115 ch0, berechnet Trimmed Mean
-3. Ergebnis → `s_bridge_cfg.idle_current` (NVS-Persist) + `s_idle_current_measured_mV`
-4. Nächster Heartbeat enthält `"idle_current_mV": <Wert>`
-5. Server speichert Wert in `bridge_config.idle_current`
-6. Beim Config-Sync (Admin-Änderung) überschreibt Server-Wert den lokalen Wert
+2. `idle_measure_task` misst ADS1115 ch0, speichert in `s_bridge_cfg.idle_current` (NVS) + `s_idle_current_measured_mV`
+3. Nächster Heartbeat enthält `"idle_current_mV": <Wert>`
+4. Server speichert Wert in `bridge_config.idle_current`
+5. Beim Config-Sync (Admin-Änderung) überschreibt Server-Wert den lokalen Wert
 
 ## Konfiguration
 
@@ -109,14 +128,19 @@ Firmware für das **LiMa (Lernen im Makerspace) Bridge**-Gerät, das auf einem *
 | `HEARTBEAT_INTERVAL_MS` | `300000` (5 Min.) | Heartbeat-Intervall konfiguriert |
 | `HEARTBEAT_INTERVAL_UNCONFIGURED_MS` | `60000` (1 Min.) | Heartbeat-Intervall unkonfiguriert |
 | `AUTH_HTTP_RETRY_COUNT` | `2` | Retries bei HTTP-Timeout |
-| `IDLE_MEASURE_SAMPLES` | `5` | ADS1115-Messwiederholungen (Trimmed Mean) |
+| `CURRENT_RMS_SAMPLES` | `128` | Samples pro RMS-Berechnung (kontinuierliche Strommessung) |
+| `MCS1806_SENSITIVITY_MV_A` | `66.0` | Empfindlichkeit Stromsensor [mV/A] |
+| `MCS1806_OFFSET_MV` | `1650.0` | Ruhespannung Stromsensor bei 0A [mV] |
+| `SUPERUSER_MAX` | `32` | Max. SuperUser-UIDs pro Bridge |
+| `PN532_I2C_ADDR` | `0x54` | I2C-Adresse des PN532 |
 
 ### NVS-Namespaces
 | Namespace | Version | Inhalt |
 |-----------|---------|--------|
 | `wifi_cfg` | 2 | SSID, Passwort, IP-Konfiguration, EAP |
 | `auth_cfg` | 1 | Server-Token, MAC-Adresse |
-| `bridge_cfg` | 2 | Maschinenname, Standort, Idle-Strom, Config-Version |
+| `bridge_cfg` | 6 | Maschinenname, Standort, Idle-Strom, SuperUser-UIDs, Config-Version, Idle-Shutdown-Delay |
+| `bridge_cfg` / `zero_cal_mv` | – | Kalibrierter Nullpunkt des Stromsensors [mV] (versionierungsunabhängig) |
 
 ## Build
 

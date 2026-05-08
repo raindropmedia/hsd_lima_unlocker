@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
@@ -49,10 +50,13 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "esp_heap_caps.h"
+#include "esp_sntp.h"
 #include "esp_lcd_panel_rgb.h"
 #include "driver/gpio.h"
 #include "esp_https_ota.h"
 #include "esp_ota_ops.h"
+#include <math.h>
+#include "freertos/semphr.h"
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Build-Konfiguration: ENABLE_NFC steuert, ob echter NFC-Betrieb (PN532)
@@ -65,11 +69,11 @@
 LV_IMG_DECLARE(hsd_logo);
 
 #if ENABLE_NFC
-#define PN532_I2C_ADDR        0x54
-#define PN532_UID_MAX_LEN     10
+#define PN532_I2C_ADDR 0x54
+#define PN532_UID_MAX_LEN 10
 /* PN532 Protokoll-Konstanten */
-#define PN532_HOSTTOPN532     0xD4u
-#define PN532_CMD_SAMCONFIGURATION    0x14u
+#define PN532_HOSTTOPN532 0xD4u
+#define PN532_CMD_SAMCONFIGURATION 0x14u
 #define PN532_CMD_INLISTPASSIVETARGET 0x4Au
 #endif
 
@@ -87,20 +91,23 @@ LV_IMG_DECLARE(hsd_logo);
 #define PWRKEY_GPIO GPIO_NUM_16
 
 #define BRIDGE_CFG_NAMESPACE "bridge_cfg"
-#define BRIDGE_CFG_VERSION 2
+#define BRIDGE_CFG_VERSION 6
+#define ZERO_CAL_NVS_KEY "zero_cal_mv" /* Separater NVS-Key – versionierungsunabhaengig */
+#define SUPERUSER_MAX 32               /* Maximale Anzahl SuperUser-UIDs pro Bridge */
+#define SUPERUSER_UID_LEN 16           /* Max. Hex-Zeichen einer NFC-UID ohne Trennzeichen */
 #define HEARTBEAT_INTERVAL_MS (5 * 60 * 1000)
 #define HEARTBEAT_INTERVAL_UNCONFIGURED_MS (1 * 60 * 1000)
 
 /* Server-Endpunkte – alle Authentifizierungs-URLs zeigen auf den LiMa Server */
-#define AUTH_URL_SETUP         "https://lima.hsd.pub/api/hsd/setup"
-#define AUTH_URL_NFC            "https://lima.hsd.pub/api/hsd/nfc"
-#define AUTH_URL_LOGIN          "https://lima.hsd.pub/api/hsd/login"
-#define AUTH_URL_PIN            "https://lima.hsd.pub/api/hsd/pin"
-#define AUTH_URL_HEARTBEAT      "https://lima.hsd.pub/api/hsd/heartbeat"
-#define AUTH_URL_REGISTER_CARD  "https://lima.hsd.pub/api/hsd/register_card"
-#define OTA_URL_CHECK           "https://lima.hsd.pub/api/hsd/ota/check"
-#define OTA_URL_FIRMWARE        "https://lima.hsd.pub/api/hsd/ota/firmware"
-#define DEV_TLS_INSECURE 0      /* Let's Encrypt: echte Zertifikatspruefung aktiv */
+#define AUTH_URL_SETUP "https://lima.hsd.pub/api/hsd/setup"
+#define AUTH_URL_NFC "https://lima.hsd.pub/api/hsd/nfc"
+#define AUTH_URL_LOGIN "https://lima.hsd.pub/api/hsd/login"
+#define AUTH_URL_PIN "https://lima.hsd.pub/api/hsd/pin"
+#define AUTH_URL_HEARTBEAT "https://lima.hsd.pub/api/hsd/heartbeat"
+#define AUTH_URL_REGISTER_CARD "https://lima.hsd.pub/api/hsd/register_card"
+#define OTA_URL_CHECK "https://lima.hsd.pub/api/hsd/ota/check"
+#define OTA_URL_FIRMWARE "https://lima.hsd.pub/api/hsd/ota/firmware"
+#define DEV_TLS_INSECURE 0 /* Let's Encrypt: echte Zertifikatspruefung aktiv */
 #define AUTH_HTTP_RETRY_COUNT 2
 #define AUTH_HTTP_RETRY_DELAY_MS 250
 
@@ -115,26 +122,34 @@ LV_IMG_DECLARE(hsd_logo);
 #define PN532_SCAN_FAIL_REINIT_THRESHOLD 6
 #define PN532_RECOVERY_DELAY_MS 200
 #define PN532_I2C_SCL_SPEED_HZ 100000
-#define PN532_I2C_RX_TIMEOUT_MS 120      /* Timeout fuer echte Daten-Frames (ACK, Response) */
-#define PN532_STATUS_POLL_TIMEOUT_MS 15  /* Kurzer Timeout fuer Status-Byte-Polls (kein Clock-stretch) */
-#define PN532_WAIT_READY_INTERVAL_MS 30  /* Abstand zwischen Status-Polls – laesst GT911 Bus-Zeit */
-#define PN532_ACK_TIMEOUT_MS  150
-#define PN532_CMD_TIMEOUT_MS  600
-#define PN532_SCAN_TIMEOUT_MS 660        /* >600ms PN532-interner RF-Scan + Puffer */
+#define PN532_I2C_RX_TIMEOUT_MS 120     /* Timeout fuer echte Daten-Frames (ACK, Response) */
+#define PN532_STATUS_POLL_TIMEOUT_MS 15 /* Kurzer Timeout fuer Status-Byte-Polls (kein Clock-stretch) */
+#define PN532_WAIT_READY_INTERVAL_MS 30 /* Abstand zwischen Status-Polls – laesst GT911 Bus-Zeit */
+#define PN532_ACK_TIMEOUT_MS 150
+#define PN532_CMD_TIMEOUT_MS 600
+#define PN532_SCAN_TIMEOUT_MS 660 /* >600ms PN532-interner RF-Scan + Puffer */
 #endif
 
 /* Externe Sensorik: ADS1115 (16-Bit-ADC, 4 Kanaele) + PCF8574T (8-Bit-I/O-Expander) */
-#define ADS1115_I2C_ADDR        0x48    /* ADDR-Pin auf GND */
-#define PCF8574_I2C_ADDR        0x20    /* A0-A2 auf GND    */
+#define ADS1115_I2C_ADDR 0x48 /* ADDR-Pin auf GND */
+#define PCF8574_I2C_ADDR 0x20 /* A0-A2 auf GND    */
 #define ADS1115_I2C_SCL_SPEED_HZ 400000
 #define PCF8574_I2C_SCL_SPEED_HZ 400000
 
 /* PCF8574T Pin-Belegung: P0-P3 Ausgaenge (active LOW), P4-P7 Eingaenge */
-#define PCF_PIN_LED_RED    0u    /* P0: Rote LED    (active LOW: 0=an, 1=aus) */
-#define PCF_PIN_LED_GREEN  1u    /* P1: Gruene LED  (active LOW) */
-#define PCF_PIN_RELAY      2u    /* P2: Relais      (active LOW) */
-#define PCF_OUTPUT_MASK    0x0Fu /* P0-P3: Ausgaenge; HIGH=aus, LOW=an */
-#define PCF_INPUT_MASK     0xF0u /* P4-P7: Eingaenge; immer 1 schreiben */
+#define PCF_PIN_LED_RED 0u    /* P0: Rote LED    (active LOW: 0=an, 1=aus) */
+#define PCF_PIN_LED_GREEN 1u  /* P1: Gruene LED  (active LOW) */
+#define PCF_PIN_RELAY 2u      /* P2: Relais      (active LOW) */
+#define PCF_OUTPUT_MASK 0x0Fu /* P0-P3: Ausgaenge; HIGH=aus, LOW=an */
+#define PCF_INPUT_MASK 0xF0u  /* P4-P7: Eingaenge; immer 1 schreiben */
+
+/* MCS1806 Stromsensor an ADS1115 AIN0 (A0) – 3,3V-betrieben, ±20A Range
+ * Empfindlichkeit: ~50 mV/A @ 5V, skaliert auf 3,3V: 50 × (3,3/5,0) = 33 mV/A
+ * Ruhespannung bei 0A: VCC/2 = 1,65V */
+#define MCS1806_SENSITIVITY_MV_A 66.0f /* mV pro Ampere (laut Datenblatt)   */
+#define MCS1806_OFFSET_MV 1650.0f      /* Quiescent-Ausgangsspannung bei 0A  */
+#define CURRENT_RMS_SAMPLES 128        /* Samples fuer eine RMS-Berechnung   */
+#define ADS_LSB_uV 62.5f               /* 2048 mV / 32768 LSB                */
 
 static const char *TAG = "HSD_APP";
 extern const char server_cert_pem_start[] asm("_binary_server_cert_pem_start");
@@ -145,7 +160,8 @@ extern const char server_cert_pem_end[] asm("_binary_server_cert_pem_end");
  * ════════════════════════════════════════════════════════════════════════════ */
 
 /* WLAN-Konfiguration – wird im NVS gespeichert (DHCP oder statische IP) */
-typedef struct {
+typedef struct
+{
     uint32_t version;
     uint8_t dhcp_enabled;
     char ssid[33];
@@ -153,37 +169,41 @@ typedef struct {
     char ip[16];
     char gateway[16];
     char netmask[16];
-    char dns[16];           /* Optionaler DNS-Server (leer = Router/DHCP-DNS) */
-    uint8_t eap_enabled;    /* 1 = WPA2-Enterprise (802.1x), 0 = PSK/Open */
-    char eap_identity[64];  /* Aeussere Identitaet (z.B. anonymous@eduroam.example.com) */
-    char eap_username[64];  /* Innere Identitaet / Username (z.B. user@eduroam.example.com) */
+    char dns[16];          /* Optionaler DNS-Server (leer = Router/DHCP-DNS) */
+    uint8_t eap_enabled;   /* 1 = WPA2-Enterprise (802.1x), 0 = PSK/Open */
+    char eap_identity[64]; /* Aeussere Identitaet (z.B. anonymous@eduroam.example.com) */
+    char eap_username[64]; /* Innere Identitaet / Username (z.B. user@eduroam.example.com) */
 } wifi_store_t;
 
 /* GUI-Ansichten: Start (NFC/Login), PIN-Eingabe, Ergebnis (Erfolg/Fehler) */
-typedef enum {
+typedef enum
+{
     APP_VIEW_START = 0,
     APP_VIEW_PIN,
     APP_VIEW_RESULT,
 } app_view_t;
 
 /* Auth-Quellen: bestimmt, welcher Server-Endpunkt angesprochen wird */
-typedef enum {
-    AUTH_SRC_SETUP = 0,         /* Erstregistrierung des Geräts (MAC → Token) */
-    AUTH_SRC_HEARTBEAT,         /* Periodischer Statusbericht an Server */
-    AUTH_SRC_NFC,               /* NFC-Karten-Authentifizierung */
-    AUTH_SRC_LOGIN,             /* E-Mail/Passwort-Login über GUI */
-    AUTH_SRC_PIN,               /* OTP/PIN-Eingabe (zweiter Faktor) */
-    AUTH_SRC_REGISTER_CARD,     /* NFC-Karte mit Benutzer verknüpfen */
+typedef enum
+{
+    AUTH_SRC_SETUP = 0,     /* Erstregistrierung des Geräts (MAC → Token) */
+    AUTH_SRC_HEARTBEAT,     /* Periodischer Statusbericht an Server */
+    AUTH_SRC_NFC,           /* NFC-Karten-Authentifizierung */
+    AUTH_SRC_LOGIN,         /* E-Mail/Passwort-Login über GUI */
+    AUTH_SRC_PIN,           /* OTP/PIN-Eingabe (zweiter Faktor) */
+    AUTH_SRC_REGISTER_CARD, /* NFC-Karte mit Benutzer verknüpfen */
 } auth_source_t;
 
 /* Auth-Request: wird in die Request-Queue eingereiht (value_a/b je nach Quelle) */
-typedef struct {
+typedef struct
+{
     auth_source_t source;
-    char value_a[96];   /* z.B. MAC, UID, E-Mail oder PIN */
-    char value_b[96];   /* z.B. Passwort (nur bei LOGIN) */
+    char value_a[96]; /* z.B. MAC, UID, E-Mail oder PIN */
+    char value_b[96]; /* z.B. Passwort (nur bei LOGIN) */
 } auth_request_t;
 
-typedef struct {
+typedef struct
+{
     auth_source_t source;
     bool success;
     bool pin_required;
@@ -192,13 +212,15 @@ typedef struct {
     char token[96];
 } auth_result_t;
 
-typedef struct {
+typedef struct
+{
     uint32_t version;
     char token[96];
     char mac[18];
 } auth_store_t;
 
-typedef struct {
+typedef struct
+{
     uint32_t version;
     char machine_name[64];
     char location[64];
@@ -207,13 +229,18 @@ typedef struct {
     uint8_t sound_enabled;
     uint8_t idle_detection_enabled;
     uint8_t otp_required;
-    uint8_t auto_ota;           /* 1 = automatisch updaten wenn neue Version verfuegbar */
+    uint8_t auto_ota; /* 1 = automatisch updaten wenn neue Version verfuegbar */
     uint32_t unlock_duration_min;
     uint32_t config_version;
+    float current_zero_mv;                                     /* Kalibrierter Nullpunkt des Stromsensors [mV]; 0.0 = unkalibriert → MCS1806_OFFSET_MV */
+    uint32_t idle_shutdown_delay_s;                            /* Wartezeit [s] nach Timer-Ablauf, bis Relay bei Idle abschaltet; 0 = Default 60s */
+    char superuser_uids[SUPERUSER_MAX][SUPERUSER_UID_LEN + 1]; /* SuperUser-UIDs (reine Hex-Strings, keine ':') */
+    uint8_t superuser_count;                                   /* Anzahl gültiger Einträge in superuser_uids */
 } bridge_cfg_t;
 
 /* Alle LVGL UI-Handles – zentral verwaltet für Zugriff aus Callbacks */
-typedef struct {
+typedef struct
+{
     lv_obj_t *machine_name_label;
     lv_obj_t *location_label;
     lv_obj_t *qr_code;
@@ -235,10 +262,10 @@ typedef struct {
     lv_obj_t *wifi_ssid_dropdown;
     lv_obj_t *wifi_password_ta;
     lv_obj_t *wifi_dhcp_sw;
-    lv_obj_t *wifi_eap_sw;         /* Toggle: WPA2-Enterprise aktivieren */
-    lv_obj_t *wifi_eap_cont;       /* Container fuer Enterprise-Felder (hidden bei PSK) */
-    lv_obj_t *wifi_eap_identity_ta;/* Aeussere Identitaet (anonymous@...) */
-    lv_obj_t *wifi_eap_username_ta;/* Innere Identitaet / Username */
+    lv_obj_t *wifi_eap_sw;          /* Toggle: WPA2-Enterprise aktivieren */
+    lv_obj_t *wifi_eap_cont;        /* Container fuer Enterprise-Felder (hidden bei PSK) */
+    lv_obj_t *wifi_eap_identity_ta; /* Aeussere Identitaet (anonymous@...) */
+    lv_obj_t *wifi_eap_username_ta; /* Innere Identitaet / Username */
     lv_obj_t *wifi_static_ip_cont;
     lv_obj_t *wifi_ip_ta;
     lv_obj_t *wifi_gateway_ta;
@@ -255,8 +282,13 @@ typedef struct {
     lv_obj_t *tab_net_btn;
     lv_obj_t *tab_bridge_btn;
     lv_obj_t *tab_sys_btn;
+    lv_obj_t *tab_cal_btn;
+    lv_obj_t *status_tab_cal;
+    lv_obj_t *status_clock_label;
     lv_obj_t *unlock_indicator;
     lv_obj_t *unlock_text_label;
+    lv_obj_t *reservation_banner; /* Banner: nächste Reservierung */
+    lv_obj_t *reservation_label;
     lv_obj_t *login_btn;
     lv_obj_t *revoke_unlock_btn;
     lv_obj_t *register_card_btn;
@@ -264,9 +296,11 @@ typedef struct {
     lv_obj_t *ota_status_label;
     lv_obj_t *ota_btn;
     lv_obj_t *measure_idle_btn;
+    lv_obj_t *calibrate_zero_btn;
 } ui_handles_t;
 
-typedef struct {
+typedef struct
+{
     char *response;
     size_t response_size;
     size_t response_len;
@@ -281,11 +315,11 @@ typedef struct {
 #if ENABLE_NFC
 static i2c_master_dev_handle_t s_pn532_dev = NULL;
 #endif
-static i2c_master_dev_handle_t s_ads1115_dev = NULL;  /* ADS1115 – 16-Bit ADC            */
-static i2c_master_dev_handle_t s_pcf8574_dev = NULL;  /* PCF8574T – 8-Bit I/O-Expander   */
-static volatile int16_t s_ads_raw[4] = {0, 0, 0, 0};  /* Letzter Messwert je Kanal (raw) */
-static volatile uint8_t s_pcf_input  = 0xFF;           /* Letzter gelesener Portbyte (P4-P7) */
-static volatile uint8_t s_pcf_output = 0x0F;           /* Ausgangszustand P0-P3 (active LOW, init=alle aus) */
+static i2c_master_dev_handle_t s_ads1115_dev = NULL; /* ADS1115 – 16-Bit ADC            */
+static i2c_master_dev_handle_t s_pcf8574_dev = NULL; /* PCF8574T – 8-Bit I/O-Expander   */
+static volatile int16_t s_ads_raw[4] = {0, 0, 0, 0}; /* Letzter Messwert je Kanal (raw) */
+static volatile uint8_t s_pcf_input = 0xFF;          /* Letzter gelesener Portbyte (P4-P7) */
+static volatile uint8_t s_pcf_output = 0x0F;         /* Ausgangszustand P0-P3 (active LOW, init=alle aus) */
 static wifi_store_t s_wifi_cfg = {
     .version = WIFI_CFG_VERSION,
     .dhcp_enabled = 1,
@@ -297,8 +331,10 @@ static bridge_cfg_t s_bridge_cfg = {
     .version = BRIDGE_CFG_VERSION,
 };
 static volatile bool s_bridge_cfg_updated = false;
+static volatile bool s_sntp_newly_synced = false; /* Flag: SNTP-Sync abgeschlossen → Status-Seite aktualisieren */
+static volatile bool s_sntp_ever_synced = false;  /* Bleibt true nach erstem erfolgreichen Sync */
 static volatile int64_t s_last_heartbeat_us = 0;
-static volatile int64_t s_unlock_until_us = 0;      /* Freischaltung gültig bis (Mikrosekunden, 0=gesperrt) */
+static volatile int64_t s_unlock_until_us = 0;           /* Freischaltung gültig bis (Mikrosekunden, 0=gesperrt) */
 static volatile uint32_t s_unlock_duration_orig_min = 0; /* Originalwert für Timer-Reset */
 static esp_netif_t *s_wifi_netif = NULL;
 static esp_event_handler_instance_t s_wifi_evt_instance = NULL;
@@ -311,23 +347,35 @@ static ui_handles_t s_ui = {0};
 static volatile bool s_auth_busy = false;
 static volatile int64_t s_auth_busy_since_us = 0;
 static volatile bool s_wifi_has_ip = false;
-static volatile bool s_wifi_scan_in_progress = false;  /* Scan laeuft: Reconnect-Loop pausieren */
-static volatile bool s_auto_ota_in_progress = false;   /* Auto-OTA-Task laeuft bereits */
+static volatile bool s_wifi_cfg_connect_pending = false; /* Verbindungsversuch vom WiFi-Konfig-Dialog */
+static volatile bool s_wifi_scan_in_progress = false;    /* Scan laeuft: Reconnect-Loop pausieren */
+static volatile bool s_auto_ota_in_progress = false;     /* Auto-OTA-Task laeuft bereits */
 static volatile int64_t s_setup_last_attempt_us = 0;
 static bool s_setup_log_verbose = true;
 static volatile app_view_t s_current_view = APP_VIEW_START;
 static volatile bool s_pause_nfc_polling = false;       /* NFC-Polling pausiert (z.B. während Modals) */
-static volatile bool s_reset_nfc_uid_requested = false;  /* Letzte UID vergessen, neue Karte akzeptieren */
+static volatile bool s_reset_nfc_uid_requested = false; /* Letzte UID vergessen, neue Karte akzeptieren */
 static volatile uint32_t s_vsync_count = 0;
 static lv_obj_t *s_debug_label = NULL;
 static volatile bool s_pwrkey_pressed = false;
 static char s_wifi_scan_options[1024] = "";
 static esp_io_expander_handle_t s_io_expander = NULL;
-static lv_timer_t *s_auto_return_timer = NULL;           /* 60s Auto-Rückkehr zum Startbildschirm */
-static volatile bool s_register_card_mode = false;       /* NFC-Task liest Karte für Registrierung */
-static volatile bool s_offer_card_registration = false;  /* Registrierungs-Button auf Ergebnisseite zeigen */
-static volatile bool s_auth_origin_login = false;        /* PIN-Flow kam von Login (nicht NFC) */
+static lv_timer_t *s_auto_return_timer = NULL;            /* 60s Auto-Rückkehr zum Startbildschirm */
+static volatile bool s_register_card_mode = false;        /* NFC-Task liest Karte für Registrierung */
+static volatile bool s_offer_card_registration = false;   /* Registrierungs-Button auf Ergebnisseite zeigen */
+static volatile bool s_auth_origin_login = false;         /* PIN-Flow kam von Login (nicht NFC) */
 static volatile float s_idle_current_measured_mV = -1.0f; /* <0 = noch nicht gemessen */
+static volatile float s_current_rms_a = 0.0f;             /* Aktueller Strom-RMS [A]   */
+static volatile float s_current_zero_mv = 0.0f;           /* Kalibrierter Nullpunkt [mV]; 0=→MCS1806_OFFSET_MV */
+static volatile bool s_unlock_idle_pending = false;       /* Timer abgelaufen, Idle-Prüfung läuft (Relay bleibt aktiv) */
+static volatile int64_t s_idle_below_since_us = 0;        /* Zeitstempel seit Strom erstmals unter Idle-Schwelle (µs) */
+/* Reservierungs-Daten: aus Heartbeat-Antwort befüllt */
+static char s_next_res_name[65] = "";
+static char s_next_res_start[17] = "";
+static char s_next_res_end[17] = "";
+static volatile bool s_has_next_reservation = false;
+static SemaphoreHandle_t s_ads_mutex = NULL; /* Mutex fuer ADS1115-Zugriff */
+static int64_t s_ui_btn_last_us = 0;         /* Debounce: Zeitstempel letzter UI-Klick */
 
 static void set_label_text_color(lv_obj_t *label, const char *text, lv_color_t color);
 static void set_status_text(const char *text, lv_color_t color);
@@ -344,14 +392,17 @@ static void activate_unlock(uint32_t server_duration_min);
 /* Akustisches Signal über IO-Expander: count × 80ms Beep */
 static void beep(int count)
 {
-    if (!s_bridge_cfg.sound_enabled || !s_io_expander) {
+    if (!s_bridge_cfg.sound_enabled || !s_io_expander)
+    {
         return;
     }
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < count; i++)
+    {
         esp_io_expander_set_level(s_io_expander, BSP_BEE_EN, 1);
         vTaskDelay(pdMS_TO_TICKS(80));
         esp_io_expander_set_level(s_io_expander, BSP_BEE_EN, 0);
-        if (i + 1 < count) {
+        if (i + 1 < count)
+        {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
@@ -368,21 +419,25 @@ static void IRAM_ATTR pwrkey_isr_handler(void *arg)
 static void i2c_scan_log(void)
 {
     esp_err_t err = bsp_i2c_init();
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGW(TAG, "I2C scan skipped, init failed: %s", esp_err_to_name(err));
         return;
     }
 
     i2c_master_bus_handle_t i2c_bus = bsp_i2c_get_handle();
-    if (i2c_bus == NULL) {
+    if (i2c_bus == NULL)
+    {
         ESP_LOGW(TAG, "I2C scan skipped, bus handle is NULL");
         return;
     }
 
     uint8_t found_count = 0;
     ESP_LOGI(TAG, "I2C scan start (7-bit addresses 0x03..0x77)");
-    for (uint8_t addr = 0x03; addr <= 0x77; addr++) {
-        if (i2c_master_probe(i2c_bus, addr, 10) == ESP_OK) {
+    for (uint8_t addr = 0x03; addr <= 0x77; addr++)
+    {
+        if (i2c_master_probe(i2c_bus, addr, 10) == ESP_OK)
+        {
             ESP_LOGI(TAG, "I2C device found at 0x%02X", addr);
             found_count++;
         }
@@ -395,22 +450,27 @@ static void i2c_scan_log(void)
 static esp_err_t http_capture_event_handler(esp_http_client_event_t *evt)
 {
     http_capture_t *cap = (http_capture_t *)evt->user_data;
-    if (cap == NULL) {
+    if (cap == NULL)
+    {
         return ESP_OK;
     }
 
-    if ((evt->event_id == HTTP_EVENT_ON_DATA) && (evt->data != NULL) && (evt->data_len > 0) && (cap->response != NULL) && (cap->response_size > 1)) {
+    if ((evt->event_id == HTTP_EVENT_ON_DATA) && (evt->data != NULL) && (evt->data_len > 0) && (cap->response != NULL) && (cap->response_size > 1))
+    {
         size_t remaining = (cap->response_size - 1) - cap->response_len;
         size_t copy_len = evt->data_len < remaining ? (size_t)evt->data_len : remaining;
-        if (copy_len > 0) {
+        if (copy_len > 0)
+        {
             memcpy(cap->response + cap->response_len, evt->data, copy_len);
             cap->response_len += copy_len;
             cap->response[cap->response_len] = '\0';
         }
     }
 
-    if ((evt->event_id == HTTP_EVENT_ON_HEADER) && (evt->header_key != NULL) && (evt->header_value != NULL) && (cap->token != NULL) && (cap->token_size > 1)) {
-        if (strcasecmp(evt->header_key, "X-Bridge-Token") == 0) {
+    if ((evt->event_id == HTTP_EVENT_ON_HEADER) && (evt->header_key != NULL) && (evt->header_value != NULL) && (cap->token != NULL) && (cap->token_size > 1))
+    {
+        if (strcasecmp(evt->header_key, "X-Bridge-Token") == 0)
+        {
             strncpy(cap->token, evt->header_value, cap->token_size - 1);
             cap->token[cap->token_size - 1] = '\0';
         }
@@ -470,7 +530,8 @@ static esp_err_t auth_cfg_load(auth_store_t *cfg)
     auth_cfg_set_defaults(cfg);
 
     esp_err_t err = nvs_open(AUTH_NAMESPACE, NVS_READONLY, &nvs);
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
         return ESP_OK;
     }
     ESP_RETURN_ON_ERROR(err, TAG, "NVS auth open failed");
@@ -478,7 +539,8 @@ static esp_err_t auth_cfg_load(auth_store_t *cfg)
     err = nvs_get_blob(nvs, "store", &loaded, &len);
     nvs_close(nvs);
 
-    if ((err == ESP_OK) && (len == sizeof(loaded)) && (loaded.version == AUTH_CFG_VERSION)) {
+    if ((err == ESP_OK) && (len == sizeof(loaded)) && (loaded.version == AUTH_CFG_VERSION))
+    {
         *cfg = loaded;
     }
 
@@ -513,7 +575,8 @@ static esp_err_t bridge_cfg_load(bridge_cfg_t *cfg)
     bridge_cfg_set_defaults(cfg);
 
     esp_err_t err = nvs_open(BRIDGE_CFG_NAMESPACE, NVS_READONLY, &nvs);
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
         return ESP_OK;
     }
     ESP_RETURN_ON_ERROR(err, TAG, "NVS bridge open failed");
@@ -521,11 +584,48 @@ static esp_err_t bridge_cfg_load(bridge_cfg_t *cfg)
     err = nvs_get_blob(nvs, "store", &loaded, &len);
     nvs_close(nvs);
 
-    if ((err == ESP_OK) && (len == sizeof(loaded)) && (loaded.version == BRIDGE_CFG_VERSION)) {
+    if ((err == ESP_OK) && (len == sizeof(loaded)) && (loaded.version == BRIDGE_CFG_VERSION))
+    {
         *cfg = loaded;
     }
 
     return ESP_OK;
+}
+
+/* Kalibrierter Strom-Nullpunkt separat im NVS speichern (versionierungsunabhaengig) */
+static esp_err_t zero_cal_save(float zero_mv)
+{
+    nvs_handle_t nvs = 0;
+    ESP_RETURN_ON_ERROR(nvs_open(BRIDGE_CFG_NAMESPACE, NVS_READWRITE, &nvs), TAG, "NVS zero_cal open failed");
+    uint32_t raw = 0;
+    memcpy(&raw, &zero_mv, sizeof(raw));
+    esp_err_t err = nvs_set_u32(nvs, ZERO_CAL_NVS_KEY, raw);
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return err;
+}
+
+/* Kalibrierter Strom-Nullpunkt aus NVS laden; gibt 0.0 zurück wenn nicht vorhanden */
+static float zero_cal_load(void)
+{
+    nvs_handle_t nvs = 0;
+    if (nvs_open(BRIDGE_CFG_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK)
+    {
+        return 0.0f;
+    }
+    uint32_t raw = 0;
+    esp_err_t err = nvs_get_u32(nvs, ZERO_CAL_NVS_KEY, &raw);
+    nvs_close(nvs);
+    if (err != ESP_OK)
+    {
+        return 0.0f;
+    }
+    float val = 0.0f;
+    memcpy(&val, &raw, sizeof(val));
+    return val;
 }
 
 /* Prüft ob ein gültiger Server-Token vorhanden ist */
@@ -550,7 +650,8 @@ static esp_err_t get_device_mac_text(char *buffer, size_t buffer_size)
 /* Statustext im WLAN-Modal setzen und einfärben */
 static void set_wifi_cfg_status_text(const char *text, lv_color_t color)
 {
-    if (s_ui.wifi_cfg_status_label && bsp_display_lock(30)) {
+    if (s_ui.wifi_cfg_status_label && bsp_display_lock(30))
+    {
         set_label_text_color(s_ui.wifi_cfg_status_label, text, color);
         bsp_display_unlock();
     }
@@ -559,7 +660,8 @@ static void set_wifi_cfg_status_text(const char *text, lv_color_t color)
 /* WLAN-Dropdown mit Liste verfügbarer Netze befüllen */
 static void wifi_set_dropdown_options(const char *options)
 {
-    if (s_ui.wifi_ssid_dropdown && bsp_display_lock(50)) {
+    if (s_ui.wifi_ssid_dropdown && bsp_display_lock(50))
+    {
         lv_dropdown_set_options(s_ui.wifi_ssid_dropdown, options);
         bsp_display_unlock();
     }
@@ -583,7 +685,8 @@ static esp_err_t wifi_cfg_load(wifi_store_t *cfg)
     wifi_cfg_set_defaults(cfg);
 
     esp_err_t err = nvs_open(WIFI_NAMESPACE, NVS_READONLY, &nvs);
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
         return ESP_OK;
     }
     ESP_RETURN_ON_ERROR(err, TAG, "NVS open failed");
@@ -591,7 +694,8 @@ static esp_err_t wifi_cfg_load(wifi_store_t *cfg)
     err = nvs_get_blob(nvs, "store", &loaded, &len);
     nvs_close(nvs);
 
-    if ((err == ESP_OK) && (len == sizeof(loaded)) && (loaded.version == WIFI_CFG_VERSION)) {
+    if ((err == ESP_OK) && (len == sizeof(loaded)) && (loaded.version == WIFI_CFG_VERSION))
+    {
         *cfg = loaded;
     }
 
@@ -601,7 +705,8 @@ static esp_err_t wifi_cfg_load(wifi_store_t *cfg)
 /* IPv4-Adresse aus Text parsen (für statische IP-Konfiguration) */
 static bool parse_ipv4(const char *text, ip4_addr_t *out)
 {
-    if ((text == NULL) || (text[0] == '\0')) {
+    if ((text == NULL) || (text[0] == '\0'))
+    {
         return false;
     }
     return ip4addr_aton(text, out) == 1;
@@ -617,13 +722,15 @@ static esp_err_t wifi_connect_from_cfg(const wifi_store_t *cfg)
     wifi_config_t wifi_cfg = {0};
     size_t ssid_len = strnlen(cfg->ssid, sizeof(cfg->ssid));
 
-    if (ssid_len == 0) {
+    if (ssid_len == 0)
+    {
         return ESP_ERR_INVALID_ARG;
     }
 
     memcpy(wifi_cfg.sta.ssid, cfg->ssid, ssid_len);
 
-    if (cfg->eap_enabled) {
+    if (cfg->eap_enabled)
+    {
         /* WPA2-Enterprise (PEAP/MSCHAPv2) – typisch fuer Eduroam */
         wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_ENTERPRISE;
         wifi_cfg.sta.pmf_cfg.capable = true;
@@ -633,10 +740,13 @@ static esp_err_t wifi_connect_from_cfg(const wifi_store_t *cfg)
         esp_eap_client_set_disable_time_check(true);
 
         /* Aeussere Identitaet (wird im unverschluesselten EAP-Teil gesendet) */
-        if (cfg->eap_identity[0] != '\0') {
+        if (cfg->eap_identity[0] != '\0')
+        {
             esp_eap_client_set_identity((const unsigned char *)cfg->eap_identity,
                                         (int)strlen(cfg->eap_identity));
-        } else {
+        }
+        else
+        {
             esp_eap_client_clear_identity();
         }
 
@@ -645,7 +755,9 @@ static esp_err_t wifi_connect_from_cfg(const wifi_store_t *cfg)
                                     (int)strlen(cfg->eap_username));
         esp_eap_client_set_password((const unsigned char *)cfg->password,
                                     (int)strlen(cfg->password));
-    } else {
+    }
+    else
+    {
         /* PSK oder offenes Netzwerk */
         memcpy(wifi_cfg.sta.password, cfg->password, strnlen(cfg->password, sizeof(cfg->password)));
         /* Bei leerem Passwort: offenes Netzwerk erlauben (OPEN), sonst WPA2 erzwingen */
@@ -655,22 +767,28 @@ static esp_err_t wifi_connect_from_cfg(const wifi_store_t *cfg)
         esp_wifi_sta_enterprise_disable();
     }
 
-    if (cfg->dhcp_enabled) {
+    if (cfg->dhcp_enabled)
+    {
         esp_err_t err = esp_netif_dhcpc_start(s_wifi_netif);
-        if ((err != ESP_OK) && (err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED)) {
+        if ((err != ESP_OK) && (err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED))
+        {
             return err;
         }
-    } else {
+    }
+    else
+    {
         ip4_addr_t ip = {0};
         ip4_addr_t gw = {0};
         ip4_addr_t mask = {0};
 
-        if (!parse_ipv4(cfg->ip, &ip) || !parse_ipv4(cfg->gateway, &gw) || !parse_ipv4(cfg->netmask, &mask)) {
+        if (!parse_ipv4(cfg->ip, &ip) || !parse_ipv4(cfg->gateway, &gw) || !parse_ipv4(cfg->netmask, &mask))
+        {
             return ESP_ERR_INVALID_ARG;
         }
 
         esp_err_t err = esp_netif_dhcpc_stop(s_wifi_netif);
-        if ((err != ESP_OK) && (err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED)) {
+        if ((err != ESP_OK) && (err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED))
+        {
             return err;
         }
 
@@ -682,10 +800,12 @@ static esp_err_t wifi_connect_from_cfg(const wifi_store_t *cfg)
         ESP_RETURN_ON_ERROR(esp_netif_set_ip_info(s_wifi_netif, &ip_info), TAG, "Set static IP failed");
 
         /* Optionalen DNS-Server setzen (leer = Standard beibehalten) */
-        if (cfg->dns[0] != '\0') {
+        if (cfg->dns[0] != '\0')
+        {
             ip4_addr_t dns_addr = {0};
-            if (parse_ipv4(cfg->dns, &dns_addr)) {
-                esp_netif_dns_info_t dns_info = { .ip = { .u_addr.ip4.addr = dns_addr.addr, .type = IPADDR_TYPE_V4 } };
+            if (parse_ipv4(cfg->dns, &dns_addr))
+            {
+                esp_netif_dns_info_t dns_info = {.ip = {.u_addr.ip4.addr = dns_addr.addr, .type = IPADDR_TYPE_V4}};
                 esp_netif_set_dns_info(s_wifi_netif, ESP_NETIF_DNS_MAIN, &dns_info);
             }
         }
@@ -694,10 +814,28 @@ static esp_err_t wifi_connect_from_cfg(const wifi_store_t *cfg)
     /* STA in IDLE bringen bevor set_config: verhindert "sta is connecting, cannot set config" */
     esp_wifi_disconnect();
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg), TAG, "WiFi set config failed");
-    if (cfg->eap_enabled) {
+    if (cfg->eap_enabled)
+    {
         ESP_RETURN_ON_ERROR(esp_wifi_sta_enterprise_enable(), TAG, "Enterprise enable failed");
     }
     return esp_wifi_connect();
+}
+
+/* NTP-Sync-Callback: Zeitpunkt der erfolgreichen Synchronisation loggen */
+static void sntp_sync_notification_cb(struct timeval *tv)
+{
+    (void)tv;
+    struct tm tm_now;
+    time_t now = time(NULL);
+    localtime_r(&now, &tm_now);
+    ESP_LOGI(TAG, "SNTP synchronisiert: %02d.%02d.%04d %02d:%02d:%02d (CET/CEST)",
+             tm_now.tm_mday, tm_now.tm_mon + 1, tm_now.tm_year + 1900,
+             tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
+    /* Nach erstem Sync: Poll-Intervall auf 24 Stunden reduzieren */
+    esp_sntp_set_sync_interval(24 * 60 * 60 * 1000U);
+    ESP_LOGI(TAG, "SNTP: Sync-Intervall auf 24h gesetzt");
+    s_sntp_ever_synced = true;
+    s_sntp_newly_synced = true; /* Status-Overlay beim nächsten Timer-Tick aktualisieren */
 }
 
 /* WLAN-Events: Disconnect-Retry, Got-IP, Scan-Done verarbeiten */
@@ -705,82 +843,173 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 {
     LV_UNUSED(arg);
 
-    if ((event_base == WIFI_EVENT) && (event_id == WIFI_EVENT_STA_DISCONNECTED)) {
+    if ((event_base == WIFI_EVENT) && (event_id == WIFI_EVENT_STA_DISCONNECTED))
+    {
         s_wifi_has_ip = false;
         set_status_text("WLAN getrennt", lv_color_hex(0xFCA5A5));
+
+        /* Fehler-Feedback im WiFi-Konfig-Dialog, falls ein Verbindungsversuch laeuft.
+         * WIFI_REASON_ASSOC_LEAVE (8) = wir haben esp_wifi_disconnect() selbst gerufen
+         *   → kein Fehler, gleich folgt der eigentliche Connect-Versuch. */
+        if (s_wifi_cfg_connect_pending)
+        {
+            wifi_event_sta_disconnected_t *disconn = (wifi_event_sta_disconnected_t *)event_data;
+            if (disconn->reason != WIFI_REASON_ASSOC_LEAVE)
+            {
+                s_wifi_cfg_connect_pending = false;
+                char err_msg[56];
+                switch (disconn->reason)
+                {
+                case WIFI_REASON_NO_AP_FOUND:
+                    snprintf(err_msg, sizeof(err_msg), "Netzwerk nicht gefunden");
+                    break;
+                case WIFI_REASON_AUTH_FAIL:
+                case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+                case WIFI_REASON_MIC_FAILURE:
+                    snprintf(err_msg, sizeof(err_msg), "Passwort falsch / Auth-Fehler");
+                    break;
+                case WIFI_REASON_HANDSHAKE_TIMEOUT:
+                case WIFI_REASON_CONNECTION_FAIL:
+                    snprintf(err_msg, sizeof(err_msg), "Verbindungs-Timeout");
+                    break;
+                default:
+                    snprintf(err_msg, sizeof(err_msg), "Verbindung fehlgeschlagen (%d)", disconn->reason);
+                    break;
+                }
+                set_wifi_cfg_status_text(err_msg, lv_color_hex(0xFCA5A5));
+            }
+        }
+
         /* Nicht reconnecten wenn ein Scan laeuft – sonst "STA is connecting, scan not allowed" */
-        if ((s_wifi_cfg.ssid[0] != '\0') && !s_wifi_scan_in_progress) {
+        if ((s_wifi_cfg.ssid[0] != '\0') && !s_wifi_scan_in_progress)
+        {
             esp_wifi_connect();
         }
     }
 
-    if ((event_base == IP_EVENT) && (event_id == IP_EVENT_STA_GOT_IP)) {
+    if ((event_base == IP_EVENT) && (event_id == IP_EVENT_STA_GOT_IP))
+    {
         ip_event_got_ip_t *evt = (ip_event_got_ip_t *)event_data;
         char ip_text[32] = "WLAN verbunden";
         s_wifi_has_ip = true;
+
+        /* NTP-Synchronisation starten (einmalig).
+         * Drei Server als Fallback: pool.ntp.org → time.google.com → ptbtime1.ptb.de
+         * Falls UDP 123 geblockt: time.google.com und ptbtime1.ptb.de sind
+         * häufig auch bei restriktiven Netzwerken erreichbar. */
+        if (!esp_sntp_enabled())
+        {
+            esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+            esp_sntp_setservername(0, "pool.ntp.org");
+            esp_sntp_setservername(1, "time.google.com");
+            esp_sntp_setservername(2, "ptbtime1.ptb.de");
+            esp_sntp_set_time_sync_notification_cb(sntp_sync_notification_cb);
+            esp_sntp_init();
+            ESP_LOGI(TAG, "SNTP gestartet: pool.ntp.org / time.google.com / ptbtime1.ptb.de");
+        }
         s_setup_last_attempt_us = 0;
         snprintf(ip_text, sizeof(ip_text), "WLAN " IPSTR, IP2STR(&evt->ip_info.ip));
         set_status_text(ip_text, lv_color_hex(0x86EFAC));
-        if (!enqueue_token_check_request_if_needed()) {
+
+        /* Konfig-Dialog automatisch schliessen wenn Verbindung erfolgreich */
+        if (s_wifi_cfg_connect_pending)
+        {
+            s_wifi_cfg_connect_pending = false;
+            if (s_ui.wifi_cfg_modal && bsp_display_lock(50))
+            {
+                lv_obj_add_flag(s_ui.wifi_cfg_modal, LV_OBJ_FLAG_HIDDEN);
+                if (s_ui.keyboard)
+                {
+                    lv_keyboard_set_textarea(s_ui.keyboard, NULL);
+                    lv_obj_add_flag(s_ui.keyboard, LV_OBJ_FLAG_HIDDEN);
+                }
+                bsp_display_unlock();
+            }
+        }
+
+        if (!enqueue_token_check_request_if_needed())
+        {
             enqueue_setup_request_if_needed();
         }
     }
 
-    if ((event_base == WIFI_EVENT) && (event_id == WIFI_EVENT_SCAN_DONE)) {
+    if ((event_base == WIFI_EVENT) && (event_id == WIFI_EVENT_SCAN_DONE))
+    {
         uint16_t ap_count = 0;
         wifi_ap_record_t *ap_records = NULL;
 
-        if (esp_wifi_scan_get_ap_num(&ap_count) != ESP_OK) {
+        if (esp_wifi_scan_get_ap_num(&ap_count) != ESP_OK)
+        {
             s_wifi_scan_in_progress = false;
-            if (s_wifi_cfg.ssid[0] != '\0') { wifi_connect_from_cfg(&s_wifi_cfg); }
+            if (s_wifi_cfg.ssid[0] != '\0')
+            {
+                wifi_connect_from_cfg(&s_wifi_cfg);
+            }
             set_wifi_cfg_status_text("Scan fehlgeschlagen", lv_color_hex(0xFCA5A5));
             return;
         }
 
-        if (ap_count == 0) {
+        if (ap_count == 0)
+        {
             strncpy(s_wifi_scan_options, "Kein Netzwerk gefunden", sizeof(s_wifi_scan_options) - 1);
             s_wifi_scan_options[sizeof(s_wifi_scan_options) - 1] = '\0';
             wifi_set_dropdown_options(s_wifi_scan_options);
             s_wifi_scan_in_progress = false;
-            if (s_wifi_cfg.ssid[0] != '\0') { wifi_connect_from_cfg(&s_wifi_cfg); }
+            if (s_wifi_cfg.ssid[0] != '\0')
+            {
+                wifi_connect_from_cfg(&s_wifi_cfg);
+            }
             set_wifi_cfg_status_text("Kein Netzwerk gefunden", lv_color_hex(0xFCA5A5));
             return;
         }
 
-        if (ap_count > 30) {
+        if (ap_count > 30)
+        {
             ap_count = 30;
         }
 
         ap_records = calloc(ap_count, sizeof(wifi_ap_record_t));
-        if (ap_records == NULL) {
+        if (ap_records == NULL)
+        {
             s_wifi_scan_in_progress = false;
-            if (s_wifi_cfg.ssid[0] != '\0') { wifi_connect_from_cfg(&s_wifi_cfg); }
+            if (s_wifi_cfg.ssid[0] != '\0')
+            {
+                wifi_connect_from_cfg(&s_wifi_cfg);
+            }
             set_wifi_cfg_status_text("Zu wenig RAM fuer Scan", lv_color_hex(0xFCA5A5));
             return;
         }
 
-        if (esp_wifi_scan_get_ap_records(&ap_count, ap_records) != ESP_OK) {
+        if (esp_wifi_scan_get_ap_records(&ap_count, ap_records) != ESP_OK)
+        {
             free(ap_records);
             s_wifi_scan_in_progress = false;
-            if (s_wifi_cfg.ssid[0] != '\0') { wifi_connect_from_cfg(&s_wifi_cfg); }
+            if (s_wifi_cfg.ssid[0] != '\0')
+            {
+                wifi_connect_from_cfg(&s_wifi_cfg);
+            }
             set_wifi_cfg_status_text("AP-Liste Fehler", lv_color_hex(0xFCA5A5));
             return;
         }
 
         s_wifi_scan_options[0] = '\0';
-        for (uint16_t i = 0; i < ap_count; i++) {
+        for (uint16_t i = 0; i < ap_count; i++)
+        {
             const char *ssid = (const char *)ap_records[i].ssid;
-            if (ssid[0] == '\0') {
+            if (ssid[0] == '\0')
+            {
                 continue;
             }
 
-            if (s_wifi_scan_options[0] != '\0') {
+            if (s_wifi_scan_options[0] != '\0')
+            {
                 strncat(s_wifi_scan_options, "\n", sizeof(s_wifi_scan_options) - strlen(s_wifi_scan_options) - 1);
             }
             strncat(s_wifi_scan_options, ssid, sizeof(s_wifi_scan_options) - strlen(s_wifi_scan_options) - 1);
         }
 
-        if (s_wifi_scan_options[0] == '\0') {
+        if (s_wifi_scan_options[0] == '\0')
+        {
             strncpy(s_wifi_scan_options, "Kein Netzwerk gefunden", sizeof(s_wifi_scan_options) - 1);
             s_wifi_scan_options[sizeof(s_wifi_scan_options) - 1] = '\0';
         }
@@ -790,7 +1019,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         set_wifi_cfg_status_text("Scan abgeschlossen", lv_color_hex(0x86EFAC));
         /* Scan abgeschlossen: Flag loeschen und Verbindung neu aufbauen */
         s_wifi_scan_in_progress = false;
-        if (s_wifi_cfg.ssid[0] != '\0') {
+        if (s_wifi_cfg.ssid[0] != '\0')
+        {
             wifi_connect_from_cfg(&s_wifi_cfg);
         }
     }
@@ -802,7 +1032,8 @@ static esp_err_t wifi_init_sta(void)
     ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "esp_netif init failed");
 
     esp_err_t err = esp_event_loop_create_default();
-    if ((err != ESP_OK) && (err != ESP_ERR_INVALID_STATE)) {
+    if ((err != ESP_OK) && (err != ESP_ERR_INVALID_STATE))
+    {
         return err;
     }
 
@@ -817,7 +1048,8 @@ static esp_err_t wifi_init_sta(void)
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "wifi mode set failed");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start failed");
 
-    if (s_wifi_cfg.ssid[0] == '\0') {
+    if (s_wifi_cfg.ssid[0] == '\0')
+    {
         set_status_text("WLAN nicht konfiguriert", lv_color_hex(0xFDE68A));
         return ESP_OK;
     }
@@ -830,12 +1062,15 @@ static bool enqueue_setup_request_if_needed(void)
 {
     auth_request_t req = {0};
 
-    if (auth_has_token() || s_auth_busy || (s_auth_req_queue == NULL)) {
+    if (auth_has_token() || s_auth_busy || (s_auth_req_queue == NULL))
+    {
         return false;
     }
 
-    if (s_auth_cfg.mac[0] == '\0') {
-        if (get_device_mac_text(s_auth_cfg.mac, sizeof(s_auth_cfg.mac)) != ESP_OK) {
+    if (s_auth_cfg.mac[0] == '\0')
+    {
+        if (get_device_mac_text(s_auth_cfg.mac, sizeof(s_auth_cfg.mac)) != ESP_OK)
+        {
             set_status_text("MAC Lesen fehlgeschlagen", lv_color_hex(0xFCA5A5));
             return false;
         }
@@ -844,7 +1079,8 @@ static bool enqueue_setup_request_if_needed(void)
 
     req.source = AUTH_SRC_SETUP;
     strncpy(req.value_a, s_auth_cfg.mac, sizeof(req.value_a) - 1);
-    if (!enqueue_auth_request(&req)) {
+    if (!enqueue_auth_request(&req))
+    {
         set_status_text("Setup Queue voll", lv_color_hex(0xFCA5A5));
         return false;
     }
@@ -860,12 +1096,14 @@ static bool enqueue_token_check_request_if_needed(void)
 {
     auth_request_t req = {0};
 
-    if (!auth_has_token() || s_auth_busy || (s_auth_req_queue == NULL)) {
+    if (!auth_has_token() || s_auth_busy || (s_auth_req_queue == NULL))
+    {
         return false;
     }
 
     req.source = AUTH_SRC_HEARTBEAT;
-    if (!enqueue_auth_request(&req)) {
+    if (!enqueue_auth_request(&req))
+    {
         return false;
     }
 
@@ -877,7 +1115,8 @@ static bool enqueue_token_check_request_if_needed(void)
 /* Label-Text und Farbe setzen (ohne Display-Lock, Aufrufer muss locken) */
 static void set_label_text_color(lv_obj_t *label, const char *text, lv_color_t color)
 {
-    if (!label) {
+    if (!label)
+    {
         return;
     }
     lv_label_set_text(label, text);
@@ -887,7 +1126,8 @@ static void set_label_text_color(lv_obj_t *label, const char *text, lv_color_t c
 /* Haupt-Statustext auf Startseite setzen (mit Display-Lock) */
 static void set_status_text(const char *text, lv_color_t color)
 {
-    if (s_ui.status_label && bsp_display_lock(30)) {
+    if (s_ui.status_label && bsp_display_lock(30))
+    {
         set_label_text_color(s_ui.status_label, text, color);
         bsp_display_unlock();
     }
@@ -896,10 +1136,51 @@ static void set_status_text(const char *text, lv_color_t color)
 /* NFC-UID-Anzeigetext setzen (mit Display-Lock) */
 static void set_nfc_uid_text(const char *text, lv_color_t color)
 {
-    if (s_ui.nfc_uid_label && bsp_display_lock(30)) {
+    if (s_ui.nfc_uid_label && bsp_display_lock(30))
+    {
         set_label_text_color(s_ui.nfc_uid_label, text, color);
         bsp_display_unlock();
     }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * UI-Animationen und Debounce-Helfer
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+/* lv_anim exec-Callback: setzt Gesamt-Opacity des Objekts */
+static void ui_opa_anim_cb(void *obj, int32_t v)
+{
+    lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)v, 0);
+}
+
+/* Fade-in: blendet ein Objekt über `ms` Millisekunden von unsichtbar auf sichtbar */
+static void ui_fade_in(lv_obj_t *obj, uint32_t ms)
+{
+    if (!obj)
+    {
+        return;
+    }
+    lv_obj_set_style_opa(obj, LV_OPA_TRANSP, 0);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, obj);
+    lv_anim_set_exec_cb(&a, ui_opa_anim_cb);
+    lv_anim_set_values(&a, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_set_duration(&a, ms);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
+/* Debounce: gibt false zurück wenn seit dem letzten Klick < 400 ms vergangen sind */
+static bool ui_btn_ok(void)
+{
+    int64_t now = esp_timer_get_time();
+    if (now - s_ui_btn_last_us < 400000LL)
+    {
+        return false;
+    }
+    s_ui_btn_last_us = now;
+    return true;
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -911,33 +1192,50 @@ static void set_nfc_uid_text(const char *text, lv_color_t color)
 static void show_view(app_view_t view)
 {
     s_current_view = view;
-    if (!bsp_display_lock(100)) {
+    if (!bsp_display_lock(100))
+    {
         return;
     }
 
-    if (s_ui.start_container) {
-        if (view == APP_VIEW_START) {
+    if (s_ui.start_container)
+    {
+        if (view == APP_VIEW_START)
+        {
             lv_obj_clear_flag(s_ui.start_container, LV_OBJ_FLAG_HIDDEN);
-        } else {
+            ui_fade_in(s_ui.start_container, 200);
+        }
+        else
+        {
             lv_obj_add_flag(s_ui.start_container, LV_OBJ_FLAG_HIDDEN);
         }
     }
 
-    if (s_ui.pin_container) {
-        if (view == APP_VIEW_PIN) {
-            if (s_ui.pin_ta) {
+    if (s_ui.pin_container)
+    {
+        if (view == APP_VIEW_PIN)
+        {
+            if (s_ui.pin_ta)
+            {
                 lv_textarea_set_text(s_ui.pin_ta, "");
             }
             lv_obj_clear_flag(s_ui.pin_container, LV_OBJ_FLAG_HIDDEN);
-        } else {
+            ui_fade_in(s_ui.pin_container, 200);
+        }
+        else
+        {
             lv_obj_add_flag(s_ui.pin_container, LV_OBJ_FLAG_HIDDEN);
         }
     }
 
-    if (s_ui.result_container) {
-        if (view == APP_VIEW_RESULT) {
+    if (s_ui.result_container)
+    {
+        if (view == APP_VIEW_RESULT)
+        {
             lv_obj_clear_flag(s_ui.result_container, LV_OBJ_FLAG_HIDDEN);
-        } else {
+            ui_fade_in(s_ui.result_container, 200);
+        }
+        else
+        {
             lv_obj_add_flag(s_ui.result_container, LV_OBJ_FLAG_HIDDEN);
         }
     }
@@ -952,7 +1250,8 @@ static void auto_return_timer_cb(lv_timer_t *timer)
     s_auto_return_timer = NULL;
     s_register_card_mode = false;
     s_offer_card_registration = false;
-    if (s_current_view != APP_VIEW_START) {
+    if (s_current_view != APP_VIEW_START)
+    {
         s_pause_nfc_polling = false;
         s_reset_nfc_uid_requested = true;
         show_view(APP_VIEW_START);
@@ -964,22 +1263,30 @@ static void auto_return_timer_cb(lv_timer_t *timer)
 /* Erfolgs-/Fehlerseite anzeigen und Auto-Return-Timer starten */
 static void show_result_page(bool granted, const char *text)
 {
-    if (!bsp_display_lock(100)) {
+    if (!bsp_display_lock(100))
+    {
         return;
     }
 
-    if (granted) {
+    if (granted)
+    {
         set_label_text_color(s_ui.result_icon_label, LV_SYMBOL_OK, lv_color_hex(0x22C55E));
         set_label_text_color(s_ui.result_text_label, text, lv_color_hex(0x86EFAC));
-    } else {
+    }
+    else
+    {
         set_label_text_color(s_ui.result_icon_label, LV_SYMBOL_CLOSE, lv_color_hex(0xEF4444));
         set_label_text_color(s_ui.result_text_label, text, lv_color_hex(0xFCA5A5));
     }
 
-    if (s_ui.register_card_btn) {
-        if (granted && s_offer_card_registration) {
+    if (s_ui.register_card_btn)
+    {
+        if (granted && s_offer_card_registration)
+        {
             lv_obj_clear_flag(s_ui.register_card_btn, LV_OBJ_FLAG_HIDDEN);
-        } else {
+        }
+        else
+        {
             lv_obj_add_flag(s_ui.register_card_btn, LV_OBJ_FLAG_HIDDEN);
         }
     }
@@ -988,7 +1295,8 @@ static void show_result_page(bool granted, const char *text)
     show_view(APP_VIEW_RESULT);
 
     /* Auto-return to start screen after 60 seconds */
-    if (s_auto_return_timer) {
+    if (s_auto_return_timer)
+    {
         lv_timer_del(s_auto_return_timer);
     }
     s_auto_return_timer = lv_timer_create(auto_return_timer_cb, 60000, NULL);
@@ -998,7 +1306,8 @@ static void show_result_page(bool granted, const char *text)
 /* Auth-Request in die FreeRTOS-Queue einreihen */
 static bool enqueue_auth_request(const auth_request_t *req)
 {
-    if (!s_auth_req_queue) {
+    if (!s_auth_req_queue)
+    {
         return false;
     }
     return xQueueSend(s_auth_req_queue, req, 0) == pdTRUE;
@@ -1009,27 +1318,34 @@ static bool response_is_true(const char *resp)
 {
     const char *pos = NULL;
 
-    if ((resp == NULL) || (resp[0] == '\0')) {
+    if ((resp == NULL) || (resp[0] == '\0'))
+    {
         return false;
     }
 
-    if (strstr(resp, "\"result\":true") || strstr(resp, "\"allowed\":true") || strstr(resp, "\"success\":true") || strstr(resp, "\"valid\":true")) {
+    if (strstr(resp, "\"result\":true") || strstr(resp, "\"allowed\":true") || strstr(resp, "\"success\":true") || strstr(resp, "\"valid\":true"))
+    {
         return true;
     }
 
-    if ((strcmp(resp, "true") == 0) || (strcmp(resp, "{\"result\":true}") == 0) || (strcmp(resp, "{\"valid\":true}") == 0)) {
+    if ((strcmp(resp, "true") == 0) || (strcmp(resp, "{\"result\":true}") == 0) || (strcmp(resp, "{\"valid\":true}") == 0))
+    {
         return true;
     }
 
     pos = strstr(resp, "\"valid\"");
-    if (pos != NULL) {
+    if (pos != NULL)
+    {
         pos = strchr(pos, ':');
-        if (pos != NULL) {
+        if (pos != NULL)
+        {
             pos++;
-            while ((*pos != '\0') && isspace((unsigned char)*pos)) {
+            while ((*pos != '\0') && isspace((unsigned char)*pos))
+            {
                 pos++;
             }
-            if (strncmp(pos, "true", 4) == 0) {
+            if (strncmp(pos, "true", 4) == 0)
+            {
                 return true;
             }
         }
@@ -1051,33 +1367,39 @@ static bool extract_json_string(const char *resp, const char *key, char *out, si
     const char *cursor = NULL;
     const char *end = NULL;
 
-    if ((resp == NULL) || (key == NULL) || (out == NULL) || (out_size < 2)) {
+    if ((resp == NULL) || (key == NULL) || (out == NULL) || (out_size < 2))
+    {
         return false;
     }
 
     snprintf(needle, sizeof(needle), "\"%s\"", key);
     start = strstr(resp, needle);
-    if (start == NULL) {
+    if (start == NULL)
+    {
         return false;
     }
 
     cursor = start + strlen(needle);
     cursor = strchr(cursor, ':');
-    if (cursor == NULL) {
+    if (cursor == NULL)
+    {
         return false;
     }
 
     cursor++;
-    while ((*cursor != '\0') && isspace((unsigned char)*cursor)) {
+    while ((*cursor != '\0') && isspace((unsigned char)*cursor))
+    {
         cursor++;
     }
-    if (*cursor != '"') {
+    if (*cursor != '"')
+    {
         return false;
     }
 
     start = cursor + 1;
     end = strchr(start, '"');
-    if (end == NULL) {
+    if (end == NULL)
+    {
         return false;
     }
 
@@ -1085,48 +1407,140 @@ static bool extract_json_string(const char *resp, const char *key, char *out, si
      * and standard escape sequences. Plain UTF-8 bytes are copied as-is. */
     const char *src = start;
     size_t written = 0;
-    while (src < end && written < out_size - 1) {
-        if (*src == '\\' && (src + 1) < end) {
+    while (src < end && written < out_size - 1)
+    {
+        if (*src == '\\' && (src + 1) < end)
+        {
             src++;
-            if (*src == 'u' && (src + 5) <= end) {
+            if (*src == 'u' && (src + 5) <= end)
+            {
                 /* Parse 4 hex digits after \u */
                 char hex[5] = {src[1], src[2], src[3], src[4], '\0'};
                 unsigned long cp = strtoul(hex, NULL, 16);
                 src += 5;
                 /* Encode Unicode codepoint as UTF-8 */
-                if (cp < 0x80U) {
+                if (cp < 0x80U)
+                {
                     out[written++] = (char)cp;
-                } else if (cp < 0x800U) {
-                    if (written + 1 < out_size - 1) {
+                }
+                else if (cp < 0x800U)
+                {
+                    if (written + 1 < out_size - 1)
+                    {
                         out[written++] = (char)(0xC0U | (cp >> 6));
                         out[written++] = (char)(0x80U | (cp & 0x3FU));
                     }
-                } else {
-                    if (written + 2 < out_size - 1) {
+                }
+                else
+                {
+                    if (written + 2 < out_size - 1)
+                    {
                         out[written++] = (char)(0xE0U | (cp >> 12));
                         out[written++] = (char)(0x80U | ((cp >> 6) & 0x3FU));
                         out[written++] = (char)(0x80U | (cp & 0x3FU));
                     }
                 }
-            } else {
+            }
+            else
+            {
                 /* Standard JSON escape sequences */
-                switch (*src) {
-                    case 'n':  out[written++] = '\n'; break;
-                    case 't':  out[written++] = '\t'; break;
-                    case 'r':  out[written++] = '\r'; break;
-                    case '\\': out[written++] = '\\'; break;
-                    case '"':  out[written++] = '"';  break;
-                    case '/':  out[written++] = '/';  break;
-                    default:   out[written++] = *src; break;
+                switch (*src)
+                {
+                case 'n':
+                    out[written++] = '\n';
+                    break;
+                case 't':
+                    out[written++] = '\t';
+                    break;
+                case 'r':
+                    out[written++] = '\r';
+                    break;
+                case '\\':
+                    out[written++] = '\\';
+                    break;
+                case '"':
+                    out[written++] = '"';
+                    break;
+                case '/':
+                    out[written++] = '/';
+                    break;
+                default:
+                    out[written++] = *src;
+                    break;
                 }
                 src++;
             }
-        } else {
+        }
+        else
+        {
             out[written++] = *src++;
         }
     }
     out[written] = '\0';
     return written > 0;
+}
+
+/* JSON-Array von Strings parsen: "key":["VAL1","VAL2",...]
+ * Schreibt bis zu max_items Strings der max. Länge item_size-1 in out[].
+ * Gibt Anzahl geparster Einträge zurück. */
+static int extract_json_string_array(const char *resp, const char *key,
+                                     char out[][SUPERUSER_UID_LEN + 1], int max_items)
+{
+    if (!resp || !key || !out || max_items <= 0)
+    {
+        return 0;
+    }
+    char needle[48] = {0};
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *p = strstr(resp, needle);
+    if (!p)
+    {
+        return 0;
+    }
+    p = strchr(p + strlen(needle), '[');
+    if (!p)
+    {
+        return 0;
+    }
+    p++; /* skip '[' */
+    int count = 0;
+    while (count < max_items)
+    {
+        while (*p && isspace((unsigned char)*p))
+        {
+            p++;
+        }
+        if (*p == ']' || *p == '\0')
+        {
+            break;
+        }
+        if (*p != '"')
+        {
+            p++;
+            continue;
+        }
+        p++; /* skip opening '"' */
+        const char *end = strchr(p, '"');
+        if (!end)
+        {
+            break;
+        }
+        size_t len = (size_t)(end - p);
+        if (len >= SUPERUSER_UID_LEN + 1)
+        {
+            len = SUPERUSER_UID_LEN;
+        }
+        memcpy(out[count], p, len);
+        out[count][len] = '\0';
+        count++;
+        p = end + 1; /* skip closing '"' */
+        /* skip optional comma */
+        while (*p && (*p == ',' || isspace((unsigned char)*p)))
+        {
+            p++;
+        }
+    }
+    return count;
 }
 
 /* Boolean-Wert aus JSON-Antwort extrahieren (true/false) */
@@ -1135,23 +1549,27 @@ static bool extract_json_bool(const char *resp, const char *key)
     char needle[40] = {0};
     const char *pos = NULL;
 
-    if ((resp == NULL) || (key == NULL)) {
+    if ((resp == NULL) || (key == NULL))
+    {
         return false;
     }
 
     snprintf(needle, sizeof(needle), "\"%s\"", key);
     pos = strstr(resp, needle);
-    if (pos == NULL) {
+    if (pos == NULL)
+    {
         return false;
     }
 
     pos = strchr(pos + strlen(needle), ':');
-    if (pos == NULL) {
+    if (pos == NULL)
+    {
         return false;
     }
 
     pos++;
-    while ((*pos != '\0') && isspace((unsigned char)*pos)) {
+    while ((*pos != '\0') && isspace((unsigned char)*pos))
+    {
         pos++;
     }
     return strncmp(pos, "true", 4) == 0;
@@ -1163,29 +1581,34 @@ static float extract_json_float(const char *resp, const char *key, float fallbac
     char needle[40] = {0};
     const char *pos = NULL;
 
-    if ((resp == NULL) || (key == NULL)) {
+    if ((resp == NULL) || (key == NULL))
+    {
         return fallback;
     }
 
     snprintf(needle, sizeof(needle), "\"%s\"", key);
     pos = strstr(resp, needle);
-    if (pos == NULL) {
+    if (pos == NULL)
+    {
         return fallback;
     }
 
     pos = strchr(pos + strlen(needle), ':');
-    if (pos == NULL) {
+    if (pos == NULL)
+    {
         return fallback;
     }
 
     pos++;
-    while ((*pos != '\0') && isspace((unsigned char)*pos)) {
+    while ((*pos != '\0') && isspace((unsigned char)*pos))
+    {
         pos++;
     }
 
     char *end = NULL;
     float val = strtof(pos, &end);
-    if (end == pos) {
+    if (end == pos)
+    {
         return fallback;
     }
     return val;
@@ -1197,44 +1620,116 @@ static int extract_json_int(const char *resp, const char *key, int fallback)
     char needle[40] = {0};
     const char *pos = NULL;
 
-    if ((resp == NULL) || (key == NULL)) {
+    if ((resp == NULL) || (key == NULL))
+    {
         return fallback;
     }
 
     snprintf(needle, sizeof(needle), "\"%s\"", key);
     pos = strstr(resp, needle);
-    if (pos == NULL) {
+    if (pos == NULL)
+    {
         return fallback;
     }
 
     pos = strchr(pos + strlen(needle), ':');
-    if (pos == NULL) {
+    if (pos == NULL)
+    {
         return fallback;
     }
 
     pos++;
-    while ((*pos != '\0') && isspace((unsigned char)*pos)) {
+    while ((*pos != '\0') && isspace((unsigned char)*pos))
+    {
         pos++;
     }
 
     char *end = NULL;
     long val = strtol(pos, &end, 10);
-    if (end == pos) {
+    if (end == pos)
+    {
         return fallback;
     }
     return (int)val;
 }
 
 /* Bridge-Konfiguration (Maschinenname, Standort etc.) aus Server-JSON parsen */
+/* Reservierungsbanner aktualisieren – muss aus LVGL-Task oder mit bsp_display_lock() aufgerufen werden */
+static void update_reservation_display_locked(void)
+{
+    if (!s_ui.reservation_banner || !s_ui.reservation_label)
+    {
+        return;
+    }
+    if (s_has_next_reservation && s_next_res_name[0] != '\0')
+    {
+        /* Lokal prüfen ob die Reservierung abgelaufen ist – nur wenn SNTP synchronisiert.
+         * Vergleich als Lokalzeit-String (Format "YYYY-MM-DDTHH:MM"), um Timezone-Konvertierungsfehler
+         * durch mktime() zu vermeiden. Server und Browser verwenden beide CET/CEST. */
+        if (s_sntp_ever_synced && strlen(s_next_res_end) >= 16)
+        {
+            time_t now = time(NULL);
+            struct tm tm_now;
+            localtime_r(&now, &tm_now);
+            char now_str[17];
+            snprintf(now_str, sizeof(now_str), "%04d-%02d-%02dT%02d:%02d",
+                     tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
+                     tm_now.tm_hour, tm_now.tm_min);
+            ESP_LOGD(TAG, "Reservierung Ablauf-Check: jetzt=%s end=%s", now_str, s_next_res_end);
+            if (strncmp(now_str, s_next_res_end, 16) > 0)
+            {
+                /* Abgelaufen – Banner verstecken, Daten löschen */
+                s_has_next_reservation = false;
+                s_next_res_name[0] = '\0';
+                lv_obj_add_flag(s_ui.reservation_banner, LV_OBJ_FLAG_HIDDEN);
+                return;
+            }
+        }
+        /* "YYYY-MM-DDTHH:MM" → "DD.MM. HH:MM" */
+        char fmt_start[14] = {0};
+        char fmt_end[14] = {0};
+        if (strlen(s_next_res_start) >= 16)
+        {
+            snprintf(fmt_start, sizeof(fmt_start), "%.2s.%.2s. %.5s",
+                     s_next_res_start + 8, s_next_res_start + 5, s_next_res_start + 11);
+        }
+        else
+        {
+            strncpy(fmt_start, s_next_res_start, sizeof(fmt_start) - 1);
+        }
+        if (strlen(s_next_res_end) >= 16)
+        {
+            snprintf(fmt_end, sizeof(fmt_end), "%.2s.%.2s. %.5s",
+                     s_next_res_end + 8, s_next_res_end + 5, s_next_res_end + 11);
+        }
+        else
+        {
+            strncpy(fmt_end, s_next_res_end, sizeof(fmt_end) - 1);
+        }
+
+        char buf[96] = {0};
+        snprintf(buf, sizeof(buf), LV_SYMBOL_BELL " Reserviert: %s\n%s - %s",
+                 s_next_res_name, fmt_start, fmt_end);
+        lv_label_set_text(s_ui.reservation_label, buf);
+        lv_obj_clear_flag(s_ui.reservation_banner, LV_OBJ_FLAG_HIDDEN);
+    }
+    else
+    {
+        lv_obj_add_flag(s_ui.reservation_banner, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void parse_bridge_config_from_response(const char *resp)
 {
-    if ((resp == NULL) || (resp[0] == '\0')) {
+    if ((resp == NULL) || (resp[0] == '\0'))
+    {
         return;
     }
 
     /* Look for "config" object in response */
     const char *cfg_start = strstr(resp, "\"config\"");
-    if (cfg_start == NULL) {
+    if (cfg_start == NULL)
+    {
         return;
     }
 
@@ -1248,10 +1743,23 @@ static void parse_bridge_config_from_response(const char *resp)
     s_bridge_cfg.unlock_duration_min = (uint32_t)extract_json_int(resp, "unlock_duration", 30);
     s_bridge_cfg.config_version = (uint32_t)extract_json_int(resp, "config_version", 0);
     s_bridge_cfg.auto_ota = extract_json_bool(resp, "auto_ota") ? 1 : 0;
+    s_bridge_cfg.idle_shutdown_delay_s = (uint32_t)extract_json_int(resp, "idle_shutdown_delay_s", 60);
+
+    /* SuperUser-UIDs parsen und in Konfiguration übernehmen */
+    char uids[SUPERUSER_MAX][SUPERUSER_UID_LEN + 1] = {{0}};
+    int n = extract_json_string_array(resp, "superuser_uids", uids, SUPERUSER_MAX);
+    s_bridge_cfg.superuser_count = (uint8_t)(n < 0 ? 0 : (n > SUPERUSER_MAX ? SUPERUSER_MAX : n));
+    for (int i = 0; i < s_bridge_cfg.superuser_count; i++)
+    {
+        strncpy(s_bridge_cfg.superuser_uids[i], uids[i], SUPERUSER_UID_LEN);
+        s_bridge_cfg.superuser_uids[i][SUPERUSER_UID_LEN] = '\0';
+    }
+    ESP_LOGI(TAG, "SuperUser-UIDs: %d eingetragen", s_bridge_cfg.superuser_count);
 
     /* Server-seitiger idle_current ueberschreibt auch den lokalen Messwert,
      * damit der Admin-Wert persistent als naechste Heartbeat-Payload genutzt wird. */
-    if (s_bridge_cfg.idle_current > 0.0f) {
+    if (s_bridge_cfg.idle_current > 0.0f)
+    {
         s_idle_current_measured_mV = s_bridge_cfg.idle_current;
     }
 
@@ -1270,7 +1778,7 @@ static void parse_bridge_config_from_response(const char *resp)
 /* HTTPS POST mit JSON-Payload an LiMa Server; liest Response + Token-Header */
 static esp_err_t https_post_json(const char *url, const char *payload, int *http_status, bool *ok, char *response_out, size_t response_out_size, char *token_out, size_t token_out_size)
 {
-    char response[512] = {0};
+    char response[1024] = {0};
     http_capture_t capture = {
         .response = response,
         .response_size = sizeof(response),
@@ -1279,10 +1787,12 @@ static esp_err_t https_post_json(const char *url, const char *payload, int *http
         .token_size = token_out_size,
     };
     esp_err_t err = ESP_OK;
-    if (http_status) {
+    if (http_status)
+    {
         *http_status = 0;
     }
-    if (ok) {
+    if (ok)
+    {
         *ok = false;
     }
 
@@ -1291,47 +1801,54 @@ static esp_err_t https_post_json(const char *url, const char *payload, int *http
         .method = HTTP_METHOD_POST,
         .transport_type = HTTP_TRANSPORT_OVER_SSL,
         .timeout_ms = 8000,
-        .crt_bundle_attach = esp_crt_bundle_attach,  /* Let's Encrypt via ESP-IDF Mozilla-Bundle */
+        .crt_bundle_attach = esp_crt_bundle_attach, /* Let's Encrypt via ESP-IDF Mozilla-Bundle */
         .event_handler = http_capture_event_handler,
         .user_data = &capture,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (client == NULL) {
+    if (client == NULL)
+    {
         ESP_LOGW(TAG, "HTTP client init failed (soft fail)");
         return ESP_OK;
     }
 
     err = esp_http_client_set_header(client, "Content-Type", "application/json");
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGW(TAG, "set header failed (soft fail): %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
         return ESP_OK;
     }
 
     err = esp_http_client_set_post_field(client, payload, (int)strlen(payload));
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGW(TAG, "set post failed (soft fail): %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
         return ESP_OK;
     }
 
     err = esp_http_client_perform(client);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGW(TAG, "HTTP perform failed (soft fail): %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
         return ESP_OK;
     }
 
-    if (http_status) {
+    if (http_status)
+    {
         *http_status = esp_http_client_get_status_code(client);
     }
     ESP_LOGI(TAG, "HTTP read bytes=%u content_length=%lld", (unsigned)capture.response_len, (long long)esp_http_client_get_content_length(client));
 
-    if (ok && http_status) {
+    if (ok && http_status)
+    {
         *ok = ((*http_status >= 200) && (*http_status < 300) && response_is_true(response));
     }
-    if ((response_out != NULL) && (response_out_size > 0)) {
+    if ((response_out != NULL) && (response_out_size > 0))
+    {
         strncpy(response_out, response, response_out_size - 1);
         response_out[response_out_size - 1] = '\0';
     }
@@ -1357,6 +1874,9 @@ static esp_err_t https_post_json(const char *url, const char *payload, int *http
 static void sensors_read(void);
 static void pcf8574_set_outputs(uint8_t outputs);
 static int16_t ads1115_read_channel(uint8_t ch);
+static void ads1115_start_continuous(void);
+static int16_t ads1115_read_continuous(void);
+static void current_measure_task(void *arg);
 
 static void auth_worker_task(void *arg)
 {
@@ -1365,13 +1885,15 @@ static void auth_worker_task(void *arg)
     auth_result_t res = {0};
     ESP_LOGI(TAG, "auth_worker started on core %d", (int)xPortGetCoreID());
 
-    while (1) {
-        if (xQueueReceive(s_auth_req_queue, &req, portMAX_DELAY) != pdTRUE) {
+    while (1)
+    {
+        if (xQueueReceive(s_auth_req_queue, &req, portMAX_DELAY) != pdTRUE)
+        {
             continue;
         }
 
         char payload[512] = {0};
-        char response[512] = {0};
+        char response[1024] = {0}; /* 1024 Bytes: Platz für Config + Reservierungsdaten */
         const char *url = AUTH_URL_NFC;
 
         res.source = req.source;
@@ -1381,18 +1903,28 @@ static void auth_worker_task(void *arg)
         res.unlock_duration_min = 0;
         res.token[0] = '\0';
 
-        if (req.source == AUTH_SRC_SETUP) {
+        if (req.source == AUTH_SRC_SETUP)
+        {
             snprintf(payload, sizeof(payload), "{\"mac\":\"%s\",\"fw_version\":\"" APP_VERSION "\"}", req.value_a);
             url = AUTH_URL_SETUP;
-        } else if (req.source == AUTH_SRC_HEARTBEAT) {
+        }
+        else if (req.source == AUTH_SRC_HEARTBEAT)
+        {
             int64_t until = s_unlock_until_us;
             int64_t now_us = esp_timer_get_time();
             bool unlocked = (until > 0) && (until > now_us);
             int remaining_min = unlocked ? (int)((until - now_us) / 60000000) : 0;
-            sensors_read();  /* ADS1115 + PCF8574T vor Payload lesen (~62 ms) */
-            char idle_part[48] = "";
-            if (s_idle_current_measured_mV >= 0.0f) {
-                snprintf(idle_part, sizeof(idle_part), ",\"idle_current_mV\":%.3f", s_idle_current_measured_mV);
+            sensors_read(); /* ADS1115 + PCF8574T vor Payload lesen (~62 ms) */
+            char idle_part[64] = "";
+            if (s_idle_current_measured_mV >= 0.0f)
+            {
+                snprintf(idle_part, sizeof(idle_part), ",\"idle_current_a\":%.3f,\"current_rms_a\":%.3f",
+                         (double)s_idle_current_measured_mV, (double)s_current_rms_a);
+            }
+            else
+            {
+                snprintf(idle_part, sizeof(idle_part), ",\"current_rms_a\":%.3f",
+                         (double)s_current_rms_a);
             }
             snprintf(payload, sizeof(payload),
                      "{\"token\":\"%s\",\"config_version\":%lu,\"unlock_status\":\"%s\",\"unlock_remaining_min\":%d,\"fw_version\":\"" APP_VERSION "\",\"ads\":[%d,%d,%d,%d],\"pcf\":%u%s}",
@@ -1401,76 +1933,122 @@ static void auth_worker_task(void *arg)
                      (int)s_ads_raw[0], (int)s_ads_raw[1], (int)s_ads_raw[2], (int)s_ads_raw[3],
                      (unsigned)s_pcf_input, idle_part);
             url = AUTH_URL_HEARTBEAT;
-        } else if (req.source == AUTH_SRC_NFC) {
+        }
+        else if (req.source == AUTH_SRC_NFC)
+        {
             snprintf(payload, sizeof(payload), "{\"token\":\"%s\",\"uid\":\"%s\"}", s_auth_cfg.token, req.value_a);
             url = AUTH_URL_NFC;
-        } else if (req.source == AUTH_SRC_LOGIN) {
+        }
+        else if (req.source == AUTH_SRC_LOGIN)
+        {
             snprintf(payload, sizeof(payload), "{\"token\":\"%s\",\"email\":\"%s\",\"password\":\"%s\"}", s_auth_cfg.token, req.value_a, req.value_b);
             url = AUTH_URL_LOGIN;
-        } else if (req.source == AUTH_SRC_REGISTER_CARD) {
+        }
+        else if (req.source == AUTH_SRC_REGISTER_CARD)
+        {
             snprintf(payload, sizeof(payload), "{\"token\":\"%s\",\"uid\":\"%s\"}", s_auth_cfg.token, req.value_a);
             url = AUTH_URL_REGISTER_CARD;
-        } else {
+        }
+        else
+        {
             snprintf(payload, sizeof(payload), "{\"token\":\"%s\",\"pin\":\"%s\"}", s_auth_cfg.token, req.value_a);
             url = AUTH_URL_PIN;
         }
 
         bool ok = false;
         esp_err_t err = ESP_OK;
-        for (int attempt = 0; attempt <= AUTH_HTTP_RETRY_COUNT; attempt++) {
+        for (int attempt = 0; attempt <= AUTH_HTTP_RETRY_COUNT; attempt++)
+        {
             response[0] = '\0';
             err = https_post_json(url, payload, &res.http_status, &ok, response, sizeof(response), res.token, sizeof(res.token));
             res.success = (err == ESP_OK) && ok;
 
-            if ((req.source == AUTH_SRC_SETUP) && (s_setup_log_verbose || !ok)) {
+            if ((req.source == AUTH_SRC_SETUP) && (s_setup_log_verbose || !ok))
+            {
                 ESP_LOGI(TAG, "Setup attempt=%d status=%d ok=%d response=%s token_hdr=%s", attempt, res.http_status, (int)ok, response, res.token);
             }
 
-            if ((req.source == AUTH_SRC_SETUP) && res.success) {
-                if ((res.token[0] == '\0') && !extract_json_string(response, "token", res.token, sizeof(res.token))) {
+            if ((req.source == AUTH_SRC_SETUP) && res.success)
+            {
+                if ((res.token[0] == '\0') && !extract_json_string(response, "token", res.token, sizeof(res.token)))
+                {
                     ESP_LOGW(TAG, "Setup response without token: %s", response);
                     res.success = false;
                 }
-                if (res.success) {
-                    if (extract_json_bool(response, "configured")) {
+                if (res.success)
+                {
+                    if (extract_json_bool(response, "configured"))
+                    {
                         parse_bridge_config_from_response(response);
-                    } else if (s_bridge_cfg.config_version > 0) {
+                    }
+                    else if (s_bridge_cfg.config_version > 0)
+                    {
                         ESP_LOGW(TAG, "Server reports unconfigured, clearing local config");
                         bridge_cfg_set_defaults(&s_bridge_cfg);
                         s_bridge_cfg_updated = true;
                     }
                 }
             }
-            if ((req.source == AUTH_SRC_HEARTBEAT) && res.success) {
-                if (extract_json_bool(response, "config_changed")) {
+            if ((req.source == AUTH_SRC_HEARTBEAT) && res.success)
+            {
+                if (extract_json_bool(response, "config_changed"))
+                {
                     parse_bridge_config_from_response(response);
                 }
+                /* Reservierungsdaten aus Heartbeat-Antwort lesen */
+                if (strstr(response, "\"res_name\"") != NULL)
+                {
+                    extract_json_string(response, "res_name", s_next_res_name, sizeof(s_next_res_name));
+                    extract_json_string(response, "res_start", s_next_res_start, sizeof(s_next_res_start));
+                    extract_json_string(response, "res_end", s_next_res_end, sizeof(s_next_res_end));
+                    s_has_next_reservation = (s_next_res_name[0] != '\0');
+                    ESP_LOGI(TAG, "[HEARTBEAT] Reservierung empfangen: '%s'  %s -> %s",
+                             s_next_res_name, s_next_res_start, s_next_res_end);
+                }
+                else
+                {
+                    s_has_next_reservation = false;
+                    s_next_res_name[0] = '\0';
+                    ESP_LOGI(TAG, "[HEARTBEAT] Keine Reservierung empfangen");
+                }
+                if (bsp_display_lock(50))
+                {
+                    update_reservation_display_locked();
+                    bsp_display_unlock();
+                }
             }
-            if (((req.source == AUTH_SRC_NFC) || (req.source == AUTH_SRC_LOGIN)) && res.success) {
+            if (((req.source == AUTH_SRC_NFC) || (req.source == AUTH_SRC_LOGIN)) && res.success)
+            {
                 res.pin_required = extract_json_bool(response, "pin_required");
             }
-            if (res.success) {
+            if (res.success)
+            {
                 int dur = extract_json_int(response, "unlock_duration", 0);
-                if (dur > 0) {
+                if (dur > 0)
+                {
                     res.unlock_duration_min = (uint32_t)dur;
                 }
             }
-            if (res.success || (res.http_status > 0)) {
+            if (res.success || (res.http_status > 0))
+            {
                 break;
             }
 
-            if (attempt < AUTH_HTTP_RETRY_COUNT) {
+            if (attempt < AUTH_HTTP_RETRY_COUNT)
+            {
                 ESP_LOGW(TAG, "HTTP retry %d/%d (server unreachable)", attempt + 1, AUTH_HTTP_RETRY_COUNT);
                 vTaskDelay(pdMS_TO_TICKS(AUTH_HTTP_RETRY_DELAY_MS));
             }
         }
 
-        if (err != ESP_OK) {
+        if (err != ESP_OK)
+        {
             ESP_LOGW(TAG, "HTTPS request ended with error: %s", esp_err_to_name(err));
             res.success = false;
         }
 
-        if (xQueueSend(s_auth_res_queue, &res, 0) != pdTRUE) {
+        if (xQueueSend(s_auth_res_queue, &res, 0) != pdTRUE)
+        {
             ESP_LOGW(TAG, "Auth result queue full, clearing busy state");
             set_auth_busy(false);
         }
@@ -1480,28 +2058,40 @@ static void auth_worker_task(void *arg)
 /* Maschinenname, Standort und QR-Code in der GUI aktualisieren */
 static void update_machine_info_ui(void)
 {
-    if (s_ui.machine_name_label) {
-        if (s_bridge_cfg.machine_name[0]) {
+    if (s_ui.machine_name_label)
+    {
+        if (s_bridge_cfg.machine_name[0])
+        {
             lv_label_set_text(s_ui.machine_name_label, s_bridge_cfg.machine_name);
             lv_obj_clear_flag(s_ui.machine_name_label, LV_OBJ_FLAG_HIDDEN);
-        } else {
+        }
+        else
+        {
             lv_obj_add_flag(s_ui.machine_name_label, LV_OBJ_FLAG_HIDDEN);
         }
     }
-    if (s_ui.location_label) {
-        if (s_bridge_cfg.location[0]) {
+    if (s_ui.location_label)
+    {
+        if (s_bridge_cfg.location[0])
+        {
             lv_label_set_text(s_ui.location_label, s_bridge_cfg.location);
             lv_obj_clear_flag(s_ui.location_label, LV_OBJ_FLAG_HIDDEN);
-        } else {
+        }
+        else
+        {
             lv_obj_add_flag(s_ui.location_label, LV_OBJ_FLAG_HIDDEN);
         }
     }
 #if LV_USE_QRCODE
-    if (s_ui.qr_code) {
-        if (s_bridge_cfg.info_url[0]) {
+    if (s_ui.qr_code)
+    {
+        if (s_bridge_cfg.info_url[0])
+        {
             lv_qrcode_update(s_ui.qr_code, s_bridge_cfg.info_url, strlen(s_bridge_cfg.info_url));
             lv_obj_clear_flag(s_ui.qr_code, LV_OBJ_FLAG_HIDDEN);
-        } else {
+        }
+        else
+        {
             lv_obj_add_flag(s_ui.qr_code, LV_OBJ_FLAG_HIDDEN);
         }
     }
@@ -1523,58 +2113,78 @@ static void auth_result_timer_cb(lv_timer_t *timer)
     LV_UNUSED(timer);
     auth_result_t res = {0};
 
-    while (xQueueReceive(s_auth_res_queue, &res, 0) == pdTRUE) {
+    while (xQueueReceive(s_auth_res_queue, &res, 0) == pdTRUE)
+    {
         set_auth_busy(false);
         bool server_unreachable = (res.http_status <= 0);
 
         /* Save bridge config if updated by worker task */
-        if (s_bridge_cfg_updated) {
+        if (s_bridge_cfg_updated)
+        {
             s_bridge_cfg_updated = false;
             bridge_cfg_save(&s_bridge_cfg);
             update_machine_info_ui();
             ESP_LOGI(TAG, "Bridge config saved to NVS (ver=%lu)", (unsigned long)s_bridge_cfg.config_version);
         }
 
-        if (res.source == AUTH_SRC_SETUP) {
-            if (res.success && (res.token[0] != '\0')) {
+        if (res.source == AUTH_SRC_SETUP)
+        {
+            if (res.success && (res.token[0] != '\0'))
+            {
                 strncpy(s_auth_cfg.token, res.token, sizeof(s_auth_cfg.token) - 1);
                 s_auth_cfg.token[sizeof(s_auth_cfg.token) - 1] = '\0';
                 auth_cfg_save(&s_auth_cfg);
                 s_setup_log_verbose = false;
                 ESP_LOGI(TAG, "Setup success, token stored: %s", s_auth_cfg.token);
-                if (s_bridge_cfg.config_version > 0) {
+                if (s_bridge_cfg.config_version > 0)
+                {
                     set_status_text("Geraet registriert", lv_color_hex(0x86EFAC));
-                } else {
+                }
+                else
+                {
                     set_status_text("Registriert, unkonfiguriert", lv_color_hex(0xFDE68A));
                 }
-                if (s_bridge_cfg.auto_ota && !s_auto_ota_in_progress) {
+                if (s_bridge_cfg.auto_ota && !s_auto_ota_in_progress)
+                {
                     s_auto_ota_in_progress = true;
                     xTaskCreatePinnedToCore(auto_ota_task, "auto_ota", 8192, NULL, 4, NULL, AUTH_TASK_CORE_ID);
                 }
-            } else if (server_unreachable) {
+            }
+            else if (server_unreachable)
+            {
                 ESP_LOGW(TAG, "Setup failed: server unreachable (http_status=%d)", res.http_status);
                 set_status_text("Setup Server nicht erreichbar", lv_color_hex(0xFCA5A5));
-            } else {
+            }
+            else
+            {
                 ESP_LOGW(TAG, "Setup failed: token missing or valid=false (http_status=%d)", res.http_status);
                 set_status_text("Setup fehlgeschlagen", lv_color_hex(0xFCA5A5));
             }
             continue;
         }
 
-        if (res.source == AUTH_SRC_HEARTBEAT) {
-            if (res.success) {
-                if (s_bridge_cfg.config_version > 0) {
+        if (res.source == AUTH_SRC_HEARTBEAT)
+        {
+            if (res.success)
+            {
+                if (s_bridge_cfg.config_version > 0)
+                {
                     ESP_LOGI(TAG, "Heartbeat OK (konfiguriert)");
                     set_status_text("Token gültig", lv_color_hex(0x86EFAC));
-                } else {
+                }
+                else
+                {
                     ESP_LOGI(TAG, "Heartbeat OK (unkonfiguriert)");
                     set_status_text("Registriert, unkonfiguriert", lv_color_hex(0xFDE68A));
                 }
-                if (s_bridge_cfg.auto_ota && !s_auto_ota_in_progress) {
+                if (s_bridge_cfg.auto_ota && !s_auto_ota_in_progress)
+                {
                     s_auto_ota_in_progress = true;
                     xTaskCreatePinnedToCore(auto_ota_task, "auto_ota", 8192, NULL, 4, NULL, AUTH_TASK_CORE_ID);
                 }
-            } else if ((res.http_status >= 400) && (res.http_status < 500)) {
+            }
+            else if ((res.http_status >= 400) && (res.http_status < 500))
+            {
                 ESP_LOGW(TAG, "Stored token invalid (http_status=%d), re-registering", res.http_status);
                 s_auth_cfg.token[0] = '\0';
                 auth_cfg_save(&s_auth_cfg);
@@ -1582,59 +2192,83 @@ static void auth_result_timer_cb(lv_timer_t *timer)
                 s_setup_last_attempt_us = 0;
                 set_status_text("Token ungültig, registriere neu...", lv_color_hex(0xFCA5A5));
                 enqueue_setup_request_if_needed();
-            } else if (server_unreachable) {
+            }
+            else if (server_unreachable)
+            {
                 ESP_LOGW(TAG, "Heartbeat: server unreachable");
                 set_status_text("Server nicht erreichbar", lv_color_hex(0xFCA5A5));
-            } else {
+            }
+            else
+            {
                 ESP_LOGW(TAG, "Heartbeat failed (http_status=%d)", res.http_status);
             }
             continue;
         }
 
-        if (res.source == AUTH_SRC_REGISTER_CARD) {
+        if (res.source == AUTH_SRC_REGISTER_CARD)
+        {
             s_register_card_mode = false;
-            if (res.success) {
+            if (res.success)
+            {
                 beep(2);
                 show_result_page(true, "Karte registriert");
-            } else if (server_unreachable) {
+            }
+            else if (server_unreachable)
+            {
                 show_result_page(false, "Server nicht erreichbar");
-            } else {
+            }
+            else
+            {
                 beep(3);
                 show_result_page(false, "Registrierung fehlgeschlagen");
             }
             continue;
         }
 
-        if (res.source == AUTH_SRC_PIN) {
-            if (res.success) {
+        if (res.source == AUTH_SRC_PIN)
+        {
+            if (res.success)
+            {
                 beep(2);
                 activate_unlock(res.unlock_duration_min);
                 s_offer_card_registration = s_auth_origin_login;
                 show_result_page(true, "Freigeschaltet");
-            } else if (server_unreachable) {
+            }
+            else if (server_unreachable)
+            {
                 show_result_page(false, "Server nicht erreichbar");
-            } else {
+            }
+            else
+            {
                 beep(3);
                 show_result_page(false, "Falsche Eingabe");
             }
             continue;
         }
 
-        if (res.success) {
-            if (res.pin_required) {
+        if (res.success)
+        {
+            if (res.pin_required)
+            {
                 s_auth_origin_login = (res.source == AUTH_SRC_LOGIN);
                 beep(1);
                 show_view(APP_VIEW_PIN);
                 set_status_text("Code eingeben", lv_color_hex(0x93C5FD));
-            } else {
+            }
+            else
+            {
                 beep(2);
                 activate_unlock(res.unlock_duration_min);
                 s_offer_card_registration = (res.source == AUTH_SRC_LOGIN);
                 show_result_page(true, "Freigeschaltet");
             }
-        } else if (server_unreachable) {
+        }
+        else if (server_unreachable)
+        {
             show_result_page(false, "Server nicht erreichbar");
-        } else {
+        }
+        else
+        {
             beep(3);
             show_result_page(false, "Verweigert");
         }
@@ -1645,7 +2279,8 @@ static void auth_result_timer_cb(lv_timer_t *timer)
 static void keyboard_event_cb(lv_event_t *event)
 {
     lv_event_code_t code = lv_event_get_code(event);
-    if ((code == LV_EVENT_READY) || (code == LV_EVENT_CANCEL)) {
+    if ((code == LV_EVENT_READY) || (code == LV_EVENT_CANCEL))
+    {
         lv_keyboard_set_textarea(s_ui.keyboard, NULL);
         lv_obj_add_flag(s_ui.keyboard, LV_OBJ_FLAG_HIDDEN);
     }
@@ -1657,10 +2292,13 @@ static void textarea_focus_event_cb(lv_event_t *event)
     lv_event_code_t code = lv_event_get_code(event);
     lv_obj_t *ta = lv_event_get_target(event);
 
-    if (code == LV_EVENT_FOCUSED) {
+    if (code == LV_EVENT_FOCUSED)
+    {
         lv_keyboard_set_textarea(s_ui.keyboard, ta);
         lv_obj_clear_flag(s_ui.keyboard, LV_OBJ_FLAG_HIDDEN);
-    } else if (code == LV_EVENT_DEFOCUSED) {
+    }
+    else if (code == LV_EVENT_DEFOCUSED)
+    {
         lv_keyboard_set_textarea(s_ui.keyboard, NULL);
         lv_obj_add_flag(s_ui.keyboard, LV_OBJ_FLAG_HIDDEN);
     }
@@ -1671,15 +2309,17 @@ static void textarea_focus_event_cb(lv_event_t *event)
 static void pwd_toggle_event_cb(lv_event_t *event)
 {
     lv_obj_t *btn = lv_event_get_target(event);
-    lv_obj_t *ta  = (lv_obj_t *)lv_event_get_user_data(event);
-    if (ta == NULL) {
+    lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(event);
+    if (ta == NULL)
+    {
         return;
     }
     bool hidden = lv_textarea_get_password_mode(ta);
     lv_textarea_set_password_mode(ta, !hidden);
     /* Symbol je nach Zustand aktualisieren */
     lv_obj_t *lbl = lv_obj_get_child(btn, 0);
-    if (lbl) {
+    if (lbl)
+    {
         lv_label_set_text(lbl, hidden ? LV_SYMBOL_EYE_CLOSE : LV_SYMBOL_EYE_OPEN);
     }
 }
@@ -1688,8 +2328,13 @@ static void pwd_toggle_event_cb(lv_event_t *event)
 static void back_to_start_event_cb(lv_event_t *event)
 {
     LV_UNUSED(event);
+    if (!ui_btn_ok())
+    {
+        return;
+    }
     /* Cancel auto-return timer if user navigates manually */
-    if (s_auto_return_timer) {
+    if (s_auto_return_timer)
+    {
         lv_timer_del(s_auto_return_timer);
         s_auto_return_timer = NULL;
     }
@@ -1707,17 +2352,20 @@ static void pin_submit_event_cb(lv_event_t *event)
 {
     LV_UNUSED(event);
 
-    if (s_auth_busy) {
+    if (s_auth_busy)
+    {
         return;
     }
 
-    if (!auth_has_token()) {
+    if (!auth_has_token())
+    {
         set_status_text("Gerät noch nicht registriert", lv_color_hex(0xFCA5A5));
         return;
     }
 
     const char *pin = lv_textarea_get_text(s_ui.pin_ta);
-    if (strlen(pin) != 6) {
+    if (strlen(pin) != 6)
+    {
         set_status_text("Code muss 6-stellig sein", lv_color_hex(0xFCA5A5));
         return;
     }
@@ -1727,7 +2375,8 @@ static void pin_submit_event_cb(lv_event_t *event)
     };
     strncpy(req.value_a, pin, sizeof(req.value_a) - 1);
 
-    if (!enqueue_auth_request(&req)) {
+    if (!enqueue_auth_request(&req))
+    {
         set_status_text("Queue voll", lv_color_hex(0xFCA5A5));
         return;
     }
@@ -1742,26 +2391,31 @@ static void pin_pad_event_cb(lv_event_t *event)
     lv_obj_t *obj = lv_event_get_target(event);
     const char *txt = lv_buttonmatrix_get_button_text(obj, lv_buttonmatrix_get_selected_button(obj));
 
-    if ((txt == NULL) || (s_ui.pin_ta == NULL)) {
+    if ((txt == NULL) || (s_ui.pin_ta == NULL))
+    {
         return;
     }
 
-    if (strcmp(txt, LV_SYMBOL_BACKSPACE) == 0) {
+    if (strcmp(txt, LV_SYMBOL_BACKSPACE) == 0)
+    {
         lv_textarea_delete_char(s_ui.pin_ta);
         return;
     }
 
-    if (strcmp(txt, "CLR") == 0) {
+    if (strcmp(txt, "CLR") == 0)
+    {
         lv_textarea_set_text(s_ui.pin_ta, "");
         return;
     }
 
-    if (strcmp(txt, "OK") == 0) {
+    if (strcmp(txt, "OK") == 0)
+    {
         pin_submit_event_cb(NULL);
         return;
     }
 
-    if ((strlen(txt) == 1) && (txt[0] >= '0') && (txt[0] <= '9')) {
+    if ((strlen(txt) == 1) && (txt[0] >= '0') && (txt[0] <= '9'))
+    {
         lv_textarea_add_text(s_ui.pin_ta, txt);
     }
 }
@@ -1775,19 +2429,22 @@ static void pin_pad_event_cb(lv_event_t *event)
 static void register_card_event_cb(lv_event_t *event)
 {
     LV_UNUSED(event);
-    if (s_auth_busy || !auth_has_token()) {
+    if (s_auth_busy || !auth_has_token())
+    {
         return;
     }
     s_offer_card_registration = false;
     /* Hide the register button and update text */
-    if (bsp_display_lock(100)) {
+    if (bsp_display_lock(100))
+    {
         lv_obj_add_flag(s_ui.register_card_btn, LV_OBJ_FLAG_HIDDEN);
         set_label_text_color(s_ui.result_icon_label, LV_SYMBOL_REFRESH, lv_color_hex(0xFDE68A));
         set_label_text_color(s_ui.result_text_label, "Bitte Karte anlegen...", lv_color_hex(0xFDE68A));
         bsp_display_unlock();
     }
     /* Cancel auto-return timer while waiting for card */
-    if (s_auto_return_timer) {
+    if (s_auto_return_timer)
+    {
         lv_timer_del(s_auto_return_timer);
         s_auto_return_timer = NULL;
     }
@@ -1798,11 +2455,13 @@ static void register_card_event_cb(lv_event_t *event)
 #else
     /* Simulation: directly enqueue with a simulated UID */
     static const char *sim_reg_uid = "AABBCCDD";
-    auth_request_t req = { .source = AUTH_SRC_REGISTER_CARD };
+    auth_request_t req = {.source = AUTH_SRC_REGISTER_CARD};
     strncpy(req.value_a, sim_reg_uid, sizeof(req.value_a) - 1);
-    if (enqueue_auth_request(&req)) {
+    if (enqueue_auth_request(&req))
+    {
         set_auth_busy(true);
-        if (bsp_display_lock(100)) {
+        if (bsp_display_lock(100))
+        {
             set_label_text_color(s_ui.result_text_label, "Karte wird registriert...", lv_color_hex(0xFDE68A));
             bsp_display_unlock();
         }
@@ -1814,8 +2473,13 @@ static void register_card_event_cb(lv_event_t *event)
 static void login_open_event_cb(lv_event_t *event)
 {
     LV_UNUSED(event);
+    if (!ui_btn_ok())
+    {
+        return;
+    }
     s_pause_nfc_polling = true;
-    if (!bsp_display_lock(100)) {
+    if (!bsp_display_lock(100))
+    {
         return;
     }
     lv_obj_clear_flag(s_ui.login_modal, LV_OBJ_FLAG_HIDDEN);
@@ -1827,16 +2491,19 @@ static void login_open_event_cb(lv_event_t *event)
 static void sim_nfc_event_cb(lv_event_t *event)
 {
     const char *uid = (const char *)lv_event_get_user_data(event);
-    if (!uid || s_auth_busy || !auth_has_token()) {
-        if (!auth_has_token()) {
+    if (!uid || s_auth_busy || !auth_has_token())
+    {
+        if (!auth_has_token())
+        {
             set_status_text("Gerät noch nicht registriert", lv_color_hex(0xFCA5A5));
         }
         return;
     }
 
-    auth_request_t req = { .source = AUTH_SRC_NFC };
+    auth_request_t req = {.source = AUTH_SRC_NFC};
     strncpy(req.value_a, uid, sizeof(req.value_a) - 1);
-    if (!enqueue_auth_request(&req)) {
+    if (!enqueue_auth_request(&req))
+    {
         set_status_text("Queue voll", lv_color_hex(0xFCA5A5));
         return;
     }
@@ -1851,8 +2518,13 @@ static void sim_nfc_event_cb(lv_event_t *event)
 static void login_close_event_cb(lv_event_t *event)
 {
     LV_UNUSED(event);
+    if (!ui_btn_ok())
+    {
+        return;
+    }
     s_pause_nfc_polling = false;
-    if (!bsp_display_lock(100)) {
+    if (!bsp_display_lock(100))
+    {
         return;
     }
     lv_obj_add_flag(s_ui.login_modal, LV_OBJ_FLAG_HIDDEN);
@@ -1866,11 +2538,13 @@ static void login_submit_event_cb(lv_event_t *event)
 {
     LV_UNUSED(event);
 
-    if (s_auth_busy) {
+    if (s_auth_busy)
+    {
         return;
     }
 
-    if (!auth_has_token()) {
+    if (!auth_has_token())
+    {
         set_status_text("Gerät noch nicht registriert", lv_color_hex(0xFCA5A5));
         return;
     }
@@ -1878,7 +2552,8 @@ static void login_submit_event_cb(lv_event_t *event)
     const char *email = lv_textarea_get_text(s_ui.login_email_ta);
     const char *password = lv_textarea_get_text(s_ui.login_password_ta);
 
-    if ((strlen(email) == 0) || (strlen(password) == 0)) {
+    if ((strlen(email) == 0) || (strlen(password) == 0))
+    {
         set_status_text("Login Daten fehlen", lv_color_hex(0xFCA5A5));
         return;
     }
@@ -1889,7 +2564,8 @@ static void login_submit_event_cb(lv_event_t *event)
     strncpy(req.value_a, email, sizeof(req.value_a) - 1);
     strncpy(req.value_b, password, sizeof(req.value_b) - 1);
 
-    if (!enqueue_auth_request(&req)) {
+    if (!enqueue_auth_request(&req))
+    {
         set_status_text("Queue voll", lv_color_hex(0xFCA5A5));
         return;
     }
@@ -1904,14 +2580,16 @@ static void wifi_cfg_close_event_cb(lv_event_t *event)
 {
     LV_UNUSED(event);
     s_pause_nfc_polling = false;
-    if (!bsp_display_lock(100)) {
+    if (!bsp_display_lock(100))
+    {
         return;
     }
 
     lv_obj_add_flag(s_ui.wifi_cfg_modal, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_ui.keyboard, LV_OBJ_FLAG_HIDDEN);
     lv_keyboard_set_textarea(s_ui.keyboard, NULL);
-    if (s_ui.unlock_indicator) {
+    if (s_ui.unlock_indicator)
+    {
         lv_obj_clear_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_HIDDEN);
     }
 
@@ -1937,10 +2615,12 @@ static void wifi_scan_event_cb(lv_event_t *event)
     vTaskDelay(pdMS_TO_TICKS(100));
 
     esp_err_t err = esp_wifi_scan_start(&scan_cfg, false);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         s_wifi_scan_in_progress = false;
         /* Verbindung wiederherstellen falls Scan nicht startete */
-        if (s_wifi_cfg.ssid[0] != '\0') {
+        if (s_wifi_cfg.ssid[0] != '\0')
+        {
             wifi_connect_from_cfg(&s_wifi_cfg);
         }
         set_wifi_cfg_status_text("Scan Start Fehler", lv_color_hex(0xFCA5A5));
@@ -1954,7 +2634,8 @@ static void wifi_scan_event_cb(lv_event_t *event)
 /* Hilfsfunktion: OTA-Statuslabel setzen (Display-Lock intern) */
 static void set_ota_status_text(const char *text, lv_color_t color)
 {
-    if (s_ui.ota_status_label && bsp_display_lock(50)) {
+    if (s_ui.ota_status_label && bsp_display_lock(50))
+    {
         lv_label_set_text(s_ui.ota_status_label, text);
         lv_obj_set_style_text_color(s_ui.ota_status_label, color, 0);
         bsp_display_unlock();
@@ -1973,7 +2654,7 @@ static void ota_task(void *arg)
 
     esp_http_client_config_t http_cfg = {
         .url = url_with_token,
-        .crt_bundle_attach = esp_crt_bundle_attach,  /* Let's Encrypt via ESP-IDF Mozilla-Bundle */
+        .crt_bundle_attach = esp_crt_bundle_attach, /* Let's Encrypt via ESP-IDF Mozilla-Bundle */
         .timeout_ms = 60000,
         .keep_alive_enable = true,
         .buffer_size = 4096,
@@ -1985,15 +2666,19 @@ static void ota_task(void *arg)
     };
 
     esp_err_t err = esp_https_ota(&ota_cfg);
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         ESP_LOGI(TAG, "OTA success, rebooting...");
         set_ota_status_text("Update OK - Neustart...", lv_color_hex(0x86EFAC));
         vTaskDelay(pdMS_TO_TICKS(2000));
         esp_restart();
-    } else {
+    }
+    else
+    {
         ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(err));
         set_ota_status_text("Update fehlgeschlagen!", lv_color_hex(0xFCA5A5));
-        if (s_ui.ota_btn && bsp_display_lock(50)) {
+        if (s_ui.ota_btn && bsp_display_lock(50))
+        {
             lv_obj_clear_flag(s_ui.ota_btn, LV_OBJ_FLAG_HIDDEN);
             bsp_display_unlock();
         }
@@ -2006,17 +2691,20 @@ static void ota_check_event_cb(lv_event_t *event)
 {
     LV_UNUSED(event);
 
-    if (!s_wifi_has_ip) {
+    if (!s_wifi_has_ip)
+    {
         set_ota_status_text("Kein WLAN", lv_color_hex(0xFCA5A5));
         return;
     }
-    if (!auth_has_token()) {
+    if (!auth_has_token())
+    {
         set_ota_status_text("Kein Token", lv_color_hex(0xFCA5A5));
         return;
     }
 
     set_ota_status_text("Prüfe Server...", lv_color_hex(0xFDE68A));
-    if (s_ui.ota_btn && bsp_display_lock(50)) {
+    if (s_ui.ota_btn && bsp_display_lock(50))
+    {
         lv_obj_add_flag(s_ui.ota_btn, LV_OBJ_FLAG_HIDDEN);
         bsp_display_unlock();
     }
@@ -2036,16 +2724,18 @@ static void ota_check_event_cb(lv_event_t *event)
 
     esp_http_client_config_t http_cfg = {
         .url = url,
-        .crt_bundle_attach = esp_crt_bundle_attach,  /* Let's Encrypt via ESP-IDF Mozilla-Bundle */
+        .crt_bundle_attach = esp_crt_bundle_attach, /* Let's Encrypt via ESP-IDF Mozilla-Bundle */
         .timeout_ms = 10000,
         .event_handler = http_capture_event_handler,
         .user_data = &cap,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
-    if (!client) {
+    if (!client)
+    {
         set_ota_status_text("HTTP-Fehler", lv_color_hex(0xFCA5A5));
-        if (s_ui.ota_btn && bsp_display_lock(50)) {
+        if (s_ui.ota_btn && bsp_display_lock(50))
+        {
             lv_obj_clear_flag(s_ui.ota_btn, LV_OBJ_FLAG_HIDDEN);
             bsp_display_unlock();
         }
@@ -2056,9 +2746,11 @@ static void ota_check_event_cb(lv_event_t *event)
     int status_code = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
-    if ((err != ESP_OK) || (status_code != 200)) {
+    if ((err != ESP_OK) || (status_code != 200))
+    {
         set_ota_status_text("Server nicht erreichbar", lv_color_hex(0xFCA5A5));
-        if (s_ui.ota_btn && bsp_display_lock(50)) {
+        if (s_ui.ota_btn && bsp_display_lock(50))
+        {
             lv_obj_clear_flag(s_ui.ota_btn, LV_OBJ_FLAG_HIDDEN);
             bsp_display_unlock();
         }
@@ -2067,17 +2759,22 @@ static void ota_check_event_cb(lv_event_t *event)
 
     /* JSON-Antwort prüfen: {"available": true, "version": "x.y.z"} */
     bool update_available = extract_json_bool(response_buf, "available");
-    if (!update_available) {
+    if (!update_available)
+    {
         char server_version[32] = {0};
         extract_json_string(response_buf, "version", server_version, sizeof(server_version));
         char msg[64] = {0};
-        if (server_version[0]) {
+        if (server_version[0])
+        {
             snprintf(msg, sizeof(msg), "Aktuell (v%s)", server_version);
-        } else {
+        }
+        else
+        {
             snprintf(msg, sizeof(msg), "Aktuell (v" APP_VERSION ")");
         }
         set_ota_status_text(msg, lv_color_hex(0x86EFAC));
-        if (s_ui.ota_btn && bsp_display_lock(50)) {
+        if (s_ui.ota_btn && bsp_display_lock(50))
+        {
             lv_obj_clear_flag(s_ui.ota_btn, LV_OBJ_FLAG_HIDDEN);
             bsp_display_unlock();
         }
@@ -2085,21 +2782,39 @@ static void ota_check_event_cb(lv_event_t *event)
     }
 
     /* Neue Version vorhanden – OTA-Task starten */
+
+    /* OTA nicht durchführen wenn Gerät gerade freigeschaltet ist */
+    if (s_unlock_until_us > 0 && esp_timer_get_time() < s_unlock_until_us)
+    {
+        set_ota_status_text("Update: Gerät freigeschaltet", lv_color_hex(0xFCA5A5));
+        if (s_ui.ota_btn && bsp_display_lock(50))
+        {
+            lv_obj_clear_flag(s_ui.ota_btn, LV_OBJ_FLAG_HIDDEN);
+            bsp_display_unlock();
+        }
+        return;
+    }
+
     char ver_msg[64] = {0};
     char new_ver[32] = {0};
     extract_json_string(response_buf, "version", new_ver, sizeof(new_ver));
-    if (new_ver[0]) {
+    if (new_ver[0])
+    {
         snprintf(ver_msg, sizeof(ver_msg), "Update auf v%s...", new_ver);
-    } else {
+    }
+    else
+    {
         snprintf(ver_msg, sizeof(ver_msg), "Update wird gestartet...");
     }
     set_ota_status_text(ver_msg, lv_color_hex(0xFDE68A));
 
     BaseType_t ota_ok = xTaskCreatePinnedToCore(ota_task, "ota_task", 8192, NULL, 4, NULL, AUTH_TASK_CORE_ID);
-    if (ota_ok != pdPASS) {
+    if (ota_ok != pdPASS)
+    {
         ESP_LOGE(TAG, "OTA task creation failed");
         set_ota_status_text("Task-Fehler", lv_color_hex(0xFCA5A5));
-        if (s_ui.ota_btn && bsp_display_lock(50)) {
+        if (s_ui.ota_btn && bsp_display_lock(50))
+        {
             lv_obj_clear_flag(s_ui.ota_btn, LV_OBJ_FLAG_HIDDEN);
             bsp_display_unlock();
         }
@@ -2113,7 +2828,8 @@ static void auto_ota_task(void *arg)
     (void)arg;
     ESP_LOGI(TAG, "Auto-OTA check started");
 
-    if (!s_wifi_has_ip || !auth_has_token()) {
+    if (!s_wifi_has_ip || !auth_has_token())
+    {
         s_auto_ota_in_progress = false;
         vTaskDelete(NULL);
         return;
@@ -2133,14 +2849,15 @@ static void auto_ota_task(void *arg)
 
     esp_http_client_config_t http_cfg = {
         .url = url,
-        .crt_bundle_attach = esp_crt_bundle_attach,  /* Let's Encrypt via ESP-IDF Mozilla-Bundle */
+        .crt_bundle_attach = esp_crt_bundle_attach, /* Let's Encrypt via ESP-IDF Mozilla-Bundle */
         .timeout_ms = 10000,
         .event_handler = http_capture_event_handler,
         .user_data = &cap,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
-    if (!client) {
+    if (!client)
+    {
         s_auto_ota_in_progress = false;
         vTaskDelete(NULL);
         return;
@@ -2150,7 +2867,8 @@ static void auto_ota_task(void *arg)
     int status_code = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
-    if ((err != ESP_OK) || (status_code != 200)) {
+    if ((err != ESP_OK) || (status_code != 200))
+    {
         ESP_LOGW(TAG, "Auto-OTA: server not reachable (err=%d status=%d)", (int)err, status_code);
         s_auto_ota_in_progress = false;
         vTaskDelete(NULL);
@@ -2158,7 +2876,8 @@ static void auto_ota_task(void *arg)
     }
 
     bool update_available = extract_json_bool(response_buf, "available");
-    if (!update_available) {
+    if (!update_available)
+    {
         char server_ver[32] = {0};
         extract_json_string(response_buf, "version", server_ver, sizeof(server_ver));
         ESP_LOGI(TAG, "Auto-OTA: firmware up to date (server=%s cur=" APP_VERSION ")", server_ver);
@@ -2169,6 +2888,16 @@ static void auto_ota_task(void *arg)
 
     char new_ver[32] = {0};
     extract_json_string(response_buf, "version", new_ver, sizeof(new_ver));
+
+    /* OTA nicht durchführen wenn Gerät gerade freigeschaltet ist */
+    if (s_unlock_until_us > 0 && esp_timer_get_time() < s_unlock_until_us)
+    {
+        ESP_LOGI(TAG, "Auto-OTA: update available but device is unlocked, skipping");
+        s_auto_ota_in_progress = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
     ESP_LOGI(TAG, "Auto-OTA: update available v%s, downloading...", new_ver);
     set_ota_status_text("Auto-Update wird heruntergeladen...", lv_color_hex(0xFDE68A));
 
@@ -2177,21 +2906,24 @@ static void auto_ota_task(void *arg)
 
     esp_http_client_config_t fw_cfg = {
         .url = url_fw,
-        .crt_bundle_attach = esp_crt_bundle_attach,  /* Let's Encrypt via ESP-IDF Mozilla-Bundle */
+        .crt_bundle_attach = esp_crt_bundle_attach, /* Let's Encrypt via ESP-IDF Mozilla-Bundle */
         .timeout_ms = 60000,
         .keep_alive_enable = true,
         .buffer_size = 4096,
         .buffer_size_tx = 1024,
     };
 
-    esp_https_ota_config_t ota_cfg = { .http_config = &fw_cfg };
+    esp_https_ota_config_t ota_cfg = {.http_config = &fw_cfg};
     esp_err_t ota_err = esp_https_ota(&ota_cfg);
-    if (ota_err == ESP_OK) {
+    if (ota_err == ESP_OK)
+    {
         ESP_LOGI(TAG, "Auto-OTA success, rebooting...");
         set_ota_status_text("Auto-Update OK - Neustart...", lv_color_hex(0x86EFAC));
         vTaskDelay(pdMS_TO_TICKS(2000));
         esp_restart();
-    } else {
+    }
+    else
+    {
         ESP_LOGE(TAG, "Auto-OTA failed: %s", esp_err_to_name(ota_err));
         set_ota_status_text("Auto-Update fehlgeschlagen!", lv_color_hex(0xFCA5A5));
         s_auto_ota_in_progress = false;
@@ -2203,13 +2935,17 @@ static void auto_ota_task(void *arg)
 static void wifi_dhcp_toggle_event_cb(lv_event_t *event)
 {
     LV_UNUSED(event);
-    if (!s_ui.wifi_static_ip_cont) {
+    if (!s_ui.wifi_static_ip_cont)
+    {
         return;
     }
     bool dhcp = lv_obj_has_state(s_ui.wifi_dhcp_sw, LV_STATE_CHECKED);
-    if (dhcp) {
+    if (dhcp)
+    {
         lv_obj_add_flag(s_ui.wifi_static_ip_cont, LV_OBJ_FLAG_HIDDEN);
-    } else {
+    }
+    else
+    {
         lv_obj_clear_flag(s_ui.wifi_static_ip_cont, LV_OBJ_FLAG_HIDDEN);
     }
 }
@@ -2218,13 +2954,17 @@ static void wifi_dhcp_toggle_event_cb(lv_event_t *event)
 static void wifi_eap_toggle_event_cb(lv_event_t *event)
 {
     LV_UNUSED(event);
-    if (!s_ui.wifi_eap_cont) {
+    if (!s_ui.wifi_eap_cont)
+    {
         return;
     }
     bool eap = lv_obj_has_state(s_ui.wifi_eap_sw, LV_STATE_CHECKED);
-    if (eap) {
+    if (eap)
+    {
         lv_obj_clear_flag(s_ui.wifi_eap_cont, LV_OBJ_FLAG_HIDDEN);
-    } else {
+    }
+    else
+    {
         lv_obj_add_flag(s_ui.wifi_eap_cont, LV_OBJ_FLAG_HIDDEN);
     }
 }
@@ -2237,7 +2977,8 @@ static void wifi_cfg_save_connect_event_cb(lv_event_t *event)
     char selected_ssid[33] = {0};
     lv_dropdown_get_selected_str(s_ui.wifi_ssid_dropdown, selected_ssid, sizeof(selected_ssid));
 
-    if ((selected_ssid[0] == '\0') || (strcmp(selected_ssid, "Kein Netzwerk gefunden") == 0)) {
+    if ((selected_ssid[0] == '\0') || (strcmp(selected_ssid, "Kein Netzwerk gefunden") == 0))
+    {
         set_wifi_cfg_status_text("SSID auswaehlen", lv_color_hex(0xFCA5A5));
         return;
     }
@@ -2251,14 +2992,17 @@ static void wifi_cfg_save_connect_event_cb(lv_event_t *event)
     /* WPA2-Enterprise (802.1x) */
     bool eap = lv_obj_has_state(s_ui.wifi_eap_sw, LV_STATE_CHECKED);
     s_wifi_cfg.eap_enabled = eap ? 1 : 0;
-    if (eap) {
-        if (s_wifi_cfg.password[0] == '\0') {
+    if (eap)
+    {
+        if (s_wifi_cfg.password[0] == '\0')
+        {
             set_wifi_cfg_status_text("Passwort für Enterprise benötigt", lv_color_hex(0xFCA5A5));
             return;
         }
         const char *identity_text = lv_textarea_get_text(s_ui.wifi_eap_identity_ta);
         const char *username_text = lv_textarea_get_text(s_ui.wifi_eap_username_ta);
-        if (username_text[0] == '\0') {
+        if (username_text[0] == '\0')
+        {
             set_wifi_cfg_status_text("Username benötigt", lv_color_hex(0xFCA5A5));
             return;
         }
@@ -2266,7 +3010,9 @@ static void wifi_cfg_save_connect_event_cb(lv_event_t *event)
         s_wifi_cfg.eap_identity[sizeof(s_wifi_cfg.eap_identity) - 1] = '\0';
         strncpy(s_wifi_cfg.eap_username, username_text, sizeof(s_wifi_cfg.eap_username) - 1);
         s_wifi_cfg.eap_username[sizeof(s_wifi_cfg.eap_username) - 1] = '\0';
-    } else {
+    }
+    else
+    {
         s_wifi_cfg.eap_identity[0] = '\0';
         s_wifi_cfg.eap_username[0] = '\0';
     }
@@ -2274,13 +3020,15 @@ static void wifi_cfg_save_connect_event_cb(lv_event_t *event)
     /* DHCP / statische IP */
     bool dhcp = lv_obj_has_state(s_ui.wifi_dhcp_sw, LV_STATE_CHECKED);
     s_wifi_cfg.dhcp_enabled = dhcp ? 1 : 0;
-    if (!dhcp) {
+    if (!dhcp)
+    {
         const char *ip_text = lv_textarea_get_text(s_ui.wifi_ip_ta);
         const char *gw_text = lv_textarea_get_text(s_ui.wifi_gateway_ta);
         const char *nm_text = lv_textarea_get_text(s_ui.wifi_netmask_ta);
 
         ip4_addr_t tmp = {0};
-        if (!parse_ipv4(ip_text, &tmp) || !parse_ipv4(gw_text, &tmp) || !parse_ipv4(nm_text, &tmp)) {
+        if (!parse_ipv4(ip_text, &tmp) || !parse_ipv4(gw_text, &tmp) || !parse_ipv4(nm_text, &tmp))
+        {
             set_wifi_cfg_status_text("Ungültige IP-Adresse", lv_color_hex(0xFCA5A5));
             return;
         }
@@ -2294,59 +3042,93 @@ static void wifi_cfg_save_connect_event_cb(lv_event_t *event)
 
         /* DNS: optional, leer ist erlaubt; falls angegeben muss IP gueltig sein */
         const char *dns_text = lv_textarea_get_text(s_ui.wifi_dns_ta);
-        if (dns_text[0] != '\0') {
+        if (dns_text[0] != '\0')
+        {
             ip4_addr_t dns_tmp = {0};
-            if (!parse_ipv4(dns_text, &dns_tmp)) {
+            if (!parse_ipv4(dns_text, &dns_tmp))
+            {
                 set_wifi_cfg_status_text("Ungültige DNS-Adresse", lv_color_hex(0xFCA5A5));
                 return;
             }
             strncpy(s_wifi_cfg.dns, dns_text, sizeof(s_wifi_cfg.dns) - 1);
             s_wifi_cfg.dns[sizeof(s_wifi_cfg.dns) - 1] = '\0';
-        } else {
+        }
+        else
+        {
             s_wifi_cfg.dns[0] = '\0';
         }
     }
 
     esp_err_t err = wifi_cfg_save(&s_wifi_cfg);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         set_wifi_cfg_status_text("Speichern fehlgeschlagen", lv_color_hex(0xFCA5A5));
         return;
     }
 
     err = wifi_connect_from_cfg(&s_wifi_cfg);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         set_wifi_cfg_status_text("Verbinden fehlgeschlagen", lv_color_hex(0xFCA5A5));
         return;
     }
 
     set_wifi_cfg_status_text("Verbinde...", lv_color_hex(0xFDE68A));
     set_status_text("WLAN verbindet...", lv_color_hex(0xFDE68A));
+    s_wifi_cfg_connect_pending = true;
 }
 
 /* Status-Seiten (Netzwerk/Bridge/System) mit aktuellen Werten füllen */
 static void status_update_info(void)
 {
-    char buf[384] = {0};
+    char buf[512] = {0};
     char mac_buf[18] = "??";
     get_device_mac_text(mac_buf, sizeof(mac_buf));
 
     /* --- Network tab --- */
-    if (s_ui.status_net_label) {
+    if (s_ui.status_net_label)
+    {
         esp_netif_ip_info_t ip_info = {0};
         char ip_str[16] = "-";
         char gw_str[16] = "-";
         char mask_str[16] = "-";
         char dns_str[16] = "-";
-        if (s_wifi_netif && (esp_netif_get_ip_info(s_wifi_netif, &ip_info) == ESP_OK) && ip_info.ip.addr) {
+        if (s_wifi_netif && (esp_netif_get_ip_info(s_wifi_netif, &ip_info) == ESP_OK) && ip_info.ip.addr)
+        {
             snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
             snprintf(gw_str, sizeof(gw_str), IPSTR, IP2STR(&ip_info.gw));
             snprintf(mask_str, sizeof(mask_str), IPSTR, IP2STR(&ip_info.netmask));
         }
         esp_netif_dns_info_t dns_info = {0};
-        if (s_wifi_netif && (esp_netif_get_dns_info(s_wifi_netif, ESP_NETIF_DNS_MAIN, &dns_info) == ESP_OK)
-            && dns_info.ip.u_addr.ip4.addr != 0) {
+        if (s_wifi_netif && (esp_netif_get_dns_info(s_wifi_netif, ESP_NETIF_DNS_MAIN, &dns_info) == ESP_OK) && dns_info.ip.u_addr.ip4.addr != 0)
+        {
             snprintf(dns_str, sizeof(dns_str), IPSTR, IP2STR(&dns_info.ip.u_addr.ip4));
         }
+        /* NTP-Status ermitteln: s_sntp_ever_synced bleibt true nach erstem Sync,
+         * da SNTP_SYNC_STATUS_COMPLETED nach der Synchronisation wieder zurückgesetzt wird. */
+        bool ntp_synced = s_sntp_ever_synced;
+        /* Alle konfigurierten NTP-Server anzeigen */
+        char ntp_servers[96] = "-";
+        if (esp_sntp_enabled())
+        {
+            ntp_servers[0] = '\0';
+            for (int i = 0; i < 3; i++)
+            {
+                const char *srv = esp_sntp_getservername(i);
+                if (srv && srv[0] != '\0')
+                {
+                    if (ntp_servers[0] != '\0')
+                        strncat(ntp_servers, "\n  ", sizeof(ntp_servers) - strlen(ntp_servers) - 1);
+                    strncat(ntp_servers, srv, sizeof(ntp_servers) - strlen(ntp_servers) - 1);
+                }
+            }
+            if (ntp_servers[0] == '\0')
+                strncpy(ntp_servers, "-", sizeof(ntp_servers));
+        }
+        const char *ntp_status = ntp_synced
+                                     ? "Synchronisiert " LV_SYMBOL_OK
+                                     : (esp_sntp_enabled() ? "Ausstehend " LV_SYMBOL_WARNING : "Inaktiv");
+
         snprintf(buf, sizeof(buf),
                  "MAC: %s\n"
                  "SSID: %s\n"
@@ -2356,26 +3138,33 @@ static void status_update_info(void)
                  "Netmask: %s\n"
                  "DNS: %s\n"
                  "WLAN: %s\n"
+                 "NTP Server: %s\n"
+                 "NTP Status: %s\n"
                  "Token: %s",
                  mac_buf,
                  s_wifi_cfg.ssid[0] ? s_wifi_cfg.ssid : "-",
                  s_wifi_cfg.dhcp_enabled ? "Ja" : "Nein",
                  ip_str, gw_str, mask_str, dns_str,
                  s_wifi_has_ip ? "Verbunden" : "Getrennt",
+                 ntp_servers, ntp_status,
                  auth_has_token() ? "Vorhanden" : "Fehlt");
         lv_label_set_text(s_ui.status_net_label, buf);
     }
 
     /* --- Bridge config tab --- */
-    if (s_ui.status_bridge_label) {
+    if (s_ui.status_bridge_label)
+    {
         int64_t until = s_unlock_until_us;
         int64_t now_us = esp_timer_get_time();
         bool unlocked = (until > 0) && (until > now_us);
         char unlock_str[32];
-        if (unlocked) {
+        if (unlocked)
+        {
             int remaining_sec = (int)((until - now_us) / 1000000);
             snprintf(unlock_str, sizeof(unlock_str), "Aktiv (%d:%02d)", remaining_sec / 60, remaining_sec % 60);
-        } else {
+        }
+        else
+        {
             snprintf(unlock_str, sizeof(unlock_str), "Gesperrt");
         }
 
@@ -2402,7 +3191,8 @@ static void status_update_info(void)
     }
 
     /* --- System tab --- */
-    if (s_ui.status_system_label) {
+    if (s_ui.status_system_label)
+    {
         int64_t uptime_s = esp_timer_get_time() / 1000000;
         int hours = (int)(uptime_s / 3600);
         int mins = (int)((uptime_s % 3600) / 60);
@@ -2426,14 +3216,17 @@ static void status_update_info(void)
 static void wifi_cfg_show_status_page(lv_event_t *event)
 {
     LV_UNUSED(event);
-    if (!bsp_display_lock(100)) {
+    if (!bsp_display_lock(100))
+    {
         return;
     }
     status_update_info();
-    if (s_ui.wifi_cfg_page) {
+    if (s_ui.wifi_cfg_page)
+    {
         lv_obj_add_flag(s_ui.wifi_cfg_page, LV_OBJ_FLAG_HIDDEN);
     }
-    if (s_ui.wifi_status_page) {
+    if (s_ui.wifi_status_page)
+    {
         lv_obj_clear_flag(s_ui.wifi_status_page, LV_OBJ_FLAG_HIDDEN);
     }
     bsp_display_unlock();
@@ -2443,13 +3236,16 @@ static void wifi_cfg_show_status_page(lv_event_t *event)
 static void wifi_cfg_show_wifi_page(lv_event_t *event)
 {
     LV_UNUSED(event);
-    if (!bsp_display_lock(100)) {
+    if (!bsp_display_lock(100))
+    {
         return;
     }
-    if (s_ui.wifi_status_page) {
+    if (s_ui.wifi_status_page)
+    {
         lv_obj_add_flag(s_ui.wifi_status_page, LV_OBJ_FLAG_HIDDEN);
     }
-    if (s_ui.wifi_cfg_page) {
+    if (s_ui.wifi_cfg_page)
+    {
         lv_obj_clear_flag(s_ui.wifi_cfg_page, LV_OBJ_FLAG_HIDDEN);
     }
     bsp_display_unlock();
@@ -2461,36 +3257,70 @@ static void status_show_tab(int tab)
     lv_color_t active_bg = lv_color_hex(0x2563EB);
     lv_color_t inactive_bg = lv_color_hex(0x374151);
 
-    if (s_ui.status_tab_net) {
-        if (tab == 0) {
+    if (s_ui.status_tab_net)
+    {
+        if (tab == 0)
+        {
             lv_obj_clear_flag(s_ui.status_tab_net, LV_OBJ_FLAG_HIDDEN);
-        } else {
+            ui_fade_in(s_ui.status_tab_net, 160);
+        }
+        else
+        {
             lv_obj_add_flag(s_ui.status_tab_net, LV_OBJ_FLAG_HIDDEN);
         }
     }
-    if (s_ui.status_tab_bridge) {
-        if (tab == 1) {
+    if (s_ui.status_tab_bridge)
+    {
+        if (tab == 1)
+        {
             lv_obj_clear_flag(s_ui.status_tab_bridge, LV_OBJ_FLAG_HIDDEN);
-        } else {
+            ui_fade_in(s_ui.status_tab_bridge, 160);
+        }
+        else
+        {
             lv_obj_add_flag(s_ui.status_tab_bridge, LV_OBJ_FLAG_HIDDEN);
         }
     }
-    if (s_ui.status_tab_system) {
-        if (tab == 2) {
+    if (s_ui.status_tab_system)
+    {
+        if (tab == 2)
+        {
             lv_obj_clear_flag(s_ui.status_tab_system, LV_OBJ_FLAG_HIDDEN);
-        } else {
+            ui_fade_in(s_ui.status_tab_system, 160);
+        }
+        else
+        {
             lv_obj_add_flag(s_ui.status_tab_system, LV_OBJ_FLAG_HIDDEN);
         }
     }
+    if (s_ui.status_tab_cal)
+    {
+        if (tab == 3)
+        {
+            lv_obj_clear_flag(s_ui.status_tab_cal, LV_OBJ_FLAG_HIDDEN);
+            ui_fade_in(s_ui.status_tab_cal, 160);
+        }
+        else
+        {
+            lv_obj_add_flag(s_ui.status_tab_cal, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 
-    if (s_ui.tab_net_btn) {
+    if (s_ui.tab_net_btn)
+    {
         lv_obj_set_style_bg_color(s_ui.tab_net_btn, (tab == 0) ? active_bg : inactive_bg, 0);
     }
-    if (s_ui.tab_bridge_btn) {
+    if (s_ui.tab_bridge_btn)
+    {
         lv_obj_set_style_bg_color(s_ui.tab_bridge_btn, (tab == 1) ? active_bg : inactive_bg, 0);
     }
-    if (s_ui.tab_sys_btn) {
+    if (s_ui.tab_sys_btn)
+    {
         lv_obj_set_style_bg_color(s_ui.tab_sys_btn, (tab == 2) ? active_bg : inactive_bg, 0);
+    }
+    if (s_ui.tab_cal_btn)
+    {
+        lv_obj_set_style_bg_color(s_ui.tab_cal_btn, (tab == 3) ? active_bg : inactive_bg, 0);
     }
 }
 
@@ -2498,6 +3328,10 @@ static void status_show_tab(int tab)
 static void status_tab_net_cb(lv_event_t *event)
 {
     LV_UNUSED(event);
+    if (!ui_btn_ok())
+    {
+        return;
+    }
     status_show_tab(0);
 }
 
@@ -2505,6 +3339,10 @@ static void status_tab_net_cb(lv_event_t *event)
 static void status_tab_bridge_cb(lv_event_t *event)
 {
     LV_UNUSED(event);
+    if (!ui_btn_ok())
+    {
+        return;
+    }
     status_show_tab(1);
 }
 
@@ -2512,7 +3350,22 @@ static void status_tab_bridge_cb(lv_event_t *event)
 static void status_tab_system_cb(lv_event_t *event)
 {
     LV_UNUSED(event);
+    if (!ui_btn_ok())
+    {
+        return;
+    }
     status_show_tab(2);
+}
+
+/* Tab-Callback: Kalibrierung-Tab aktivieren */
+static void status_tab_cal_cb(lv_event_t *event)
+{
+    LV_UNUSED(event);
+    if (!ui_btn_ok())
+    {
+        return;
+    }
+    status_show_tab(3);
 }
 
 /* Debug-Overlay ein-/ausschalten per Switch */
@@ -2520,10 +3373,14 @@ static void debug_overlay_toggle_event_cb(lv_event_t *event)
 {
     lv_obj_t *sw = lv_event_get_target(event);
     bool checked = lv_obj_has_state(sw, LV_STATE_CHECKED);
-    if (s_debug_label) {
-        if (checked) {
+    if (s_debug_label)
+    {
+        if (checked)
+        {
             lv_obj_clear_flag(s_debug_label, LV_OBJ_FLAG_HIDDEN);
-        } else {
+        }
+        else
+        {
             lv_obj_add_flag(s_debug_label, LV_OBJ_FLAG_HIDDEN);
         }
     }
@@ -2534,13 +3391,15 @@ static void heartbeat_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
 
-    if (!auth_has_token() || !s_wifi_has_ip || s_auth_busy) {
+    if (!auth_has_token() || !s_wifi_has_ip || s_auth_busy)
+    {
         return;
     }
 
     int64_t now_us = esp_timer_get_time();
     int64_t interval_ms = (s_bridge_cfg.config_version > 0) ? HEARTBEAT_INTERVAL_MS : HEARTBEAT_INTERVAL_UNCONFIGURED_MS;
-    if ((s_last_heartbeat_us != 0) && ((now_us - s_last_heartbeat_us) < (interval_ms * 1000))) {
+    if ((s_last_heartbeat_us != 0) && ((now_us - s_last_heartbeat_us) < (interval_ms * 1000)))
+    {
         return;
     }
 
@@ -2548,7 +3407,8 @@ static void heartbeat_timer_cb(lv_timer_t *timer)
         .source = AUTH_SRC_HEARTBEAT,
     };
 
-    if (enqueue_auth_request(&req)) {
+    if (enqueue_auth_request(&req))
+    {
         set_auth_busy(true);
         s_last_heartbeat_us = now_us;
         ESP_LOGI(TAG, "Heartbeat request enqueued");
@@ -2560,21 +3420,27 @@ static void pwrkey_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
 
-    if (s_pwrkey_pressed) {
+    if (s_pwrkey_pressed)
+    {
         s_pwrkey_pressed = false;
         s_pause_nfc_polling = true;
-        if (bsp_display_lock(100)) {
+        if (bsp_display_lock(100))
+        {
             status_update_info();
-            if (s_ui.wifi_cfg_page) {
+            if (s_ui.wifi_cfg_page)
+            {
                 lv_obj_add_flag(s_ui.wifi_cfg_page, LV_OBJ_FLAG_HIDDEN);
             }
-            if (s_ui.wifi_status_page) {
+            if (s_ui.wifi_status_page)
+            {
                 lv_obj_clear_flag(s_ui.wifi_status_page, LV_OBJ_FLAG_HIDDEN);
             }
-            if (s_ui.wifi_cfg_modal) {
+            if (s_ui.wifi_cfg_modal)
+            {
                 lv_obj_clear_flag(s_ui.wifi_cfg_modal, LV_OBJ_FLAG_HIDDEN);
             }
-            if (s_ui.unlock_indicator) {
+            if (s_ui.unlock_indicator)
+            {
                 lv_obj_add_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_HIDDEN);
             }
             bsp_display_unlock();
@@ -2605,7 +3471,9 @@ static bool IRAM_ATTR vsync_event_cb(esp_lcd_panel_handle_t panel,
                                      const esp_lcd_rgb_panel_event_data_t *edata,
                                      void *user_ctx)
 {
-    (void)panel; (void)edata; (void)user_ctx;
+    (void)panel;
+    (void)edata;
+    (void)user_ctx;
     s_vsync_count++;
     return false;
 }
@@ -2620,13 +3488,67 @@ static void debug_overlay_timer_cb(lv_timer_t *timer)
     last_vsync = cur;
 
     size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024;
-    size_t sram_free  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024;
+    size_t sram_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024;
 
-    if (s_debug_label) {
-        char buf[72];
-        snprintf(buf, sizeof(buf), "VSync:%uHz  PSRAM:%uKB  SRAM:%uKB",
-                 (unsigned)fps, (unsigned)psram_free, (unsigned)sram_free);
+    if (s_debug_label)
+    {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "VSync:%uHz  PSRAM:%uKB  SRAM:%uKB  I_rms:%.2fA",
+                 (unsigned)fps, (unsigned)psram_free, (unsigned)sram_free,
+                 (double)s_current_rms_a);
         lv_label_set_text(s_debug_label, buf);
+    }
+
+    /* SNTP-Retry alle 30 Sekunden bis Synchronisation erfolgreich */
+    {
+        static int s_sntp_retry_ticks = 0;
+        if (esp_sntp_enabled() && s_wifi_has_ip && !s_sntp_ever_synced)
+        {
+            s_sntp_retry_ticks++;
+            if (s_sntp_retry_ticks >= 30)
+            {
+                s_sntp_retry_ticks = 0;
+                esp_sntp_restart();
+                ESP_LOGI(TAG, "SNTP Retry...");
+            }
+        }
+        else
+        {
+            s_sntp_retry_ticks = 0;
+        }
+    }
+
+    /* Nach erfolgreichem SNTP-Sync: Status-Seite sofort neu laden */
+    if (s_sntp_newly_synced)
+    {
+        s_sntp_newly_synced = false;
+        if (s_ui.wifi_status_page &&
+            !lv_obj_has_flag(s_ui.wifi_status_page, LV_OBJ_FLAG_HIDDEN))
+        {
+            status_update_info();
+        }
+    }
+
+    /* Uhrzeit im Board-Status-Overlay aktualisieren */
+    if (s_ui.status_clock_label)
+    {
+        time_t now = time(NULL);
+        bool synced = s_sntp_ever_synced;
+        if (now > 1000000L)
+        {
+            struct tm tm_now;
+            localtime_r(&now, &tm_now);
+            char clk[28];
+            snprintf(clk, sizeof(clk), "%02d:%02d:%02d %s",
+                     tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec,
+                     synced ? LV_SYMBOL_OK : LV_SYMBOL_WARNING);
+            lv_label_set_text(s_ui.status_clock_label, clk);
+        }
+        else
+        {
+            lv_label_set_text(s_ui.status_clock_label,
+                              esp_sntp_enabled() ? LV_SYMBOL_WARNING " NTP..." : LV_SYMBOL_WARNING " NTP inaktiv");
+        }
     }
 }
 
@@ -2641,10 +3563,12 @@ static void debug_overlay_timer_cb(lv_timer_t *timer)
 static void activate_unlock(uint32_t server_duration_min)
 {
     uint32_t dur = server_duration_min;
-    if (dur == 0) {
+    if (dur == 0)
+    {
         dur = s_bridge_cfg.unlock_duration_min;
     }
-    if (dur == 0) {
+    if (dur == 0)
+    {
         dur = 30;
     }
     s_unlock_duration_orig_min = dur;
@@ -2659,10 +3583,12 @@ static void activate_unlock(uint32_t server_duration_min)
 static void unlock_indicator_click_cb(lv_event_t *event)
 {
     LV_UNUSED(event);
-    if (s_unlock_until_us > 0) {
+    if (s_unlock_until_us > 0)
+    {
         /* Reset timer to original duration */
         uint32_t dur = s_unlock_duration_orig_min;
-        if (dur == 0) {
+        if (dur == 0)
+        {
             dur = 30;
         }
         s_unlock_until_us = esp_timer_get_time() + (int64_t)dur * 60 * 1000000;
@@ -2674,60 +3600,165 @@ static void unlock_indicator_click_cb(lv_event_t *event)
 static void unlock_timer_cb(lv_timer_t *timer)
 {
     LV_UNUSED(timer);
-    if (!s_ui.unlock_indicator) {
+    if (!s_ui.unlock_indicator)
+    {
         return;
     }
     /* Modal offen: Indikator nicht anzeigen, Zustand nicht verändern */
-    if (s_ui.wifi_cfg_modal && !lv_obj_has_flag(s_ui.wifi_cfg_modal, LV_OBJ_FLAG_HIDDEN)) {
+    if (s_ui.wifi_cfg_modal && !lv_obj_has_flag(s_ui.wifi_cfg_modal, LV_OBJ_FLAG_HIDDEN))
+    {
         lv_obj_add_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_HIDDEN);
         return;
     }
 
+    /* Reservierungs-Ablauf regelmäßig prüfen (unabhängig von Heartbeat) */
+    update_reservation_display_locked();
+
     int64_t now_us = esp_timer_get_time();
+
+    /* ── Idle-Pending: Freischalt-Timer abgelaufen, Relay bleibt bis Gerät wirklich idle ── */
+    if (s_unlock_idle_pending)
+    {
+        /* Relay + grüne LED aktiv halten während Idle-Prüfung */
+        pcf8574_set_outputs((uint8_t)(PCF_OUTPUT_MASK & ~((1u << PCF_PIN_LED_GREEN) | (1u << PCF_PIN_RELAY))));
+        if (s_ui.revoke_unlock_btn)
+        {
+            lv_obj_clear_flag(s_ui.revoke_unlock_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (s_ui.login_btn)
+        {
+            lv_obj_add_flag(s_ui.login_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        if (s_current_rms_a > s_bridge_cfg.idle_current)
+        {
+            /* Gerät wird noch benutzt – Idle-Fenster zurücksetzen */
+            s_idle_below_since_us = 0;
+            lv_obj_set_style_bg_color(s_ui.unlock_indicator, lv_color_hex(0xF97316), 0);
+            lv_obj_clear_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_HIDDEN);
+            if (s_ui.unlock_text_label)
+            {
+                lv_label_set_text(s_ui.unlock_text_label, LV_SYMBOL_WARNING " Gerät in Benutzung\nkeine Abschaltung");
+            }
+        }
+        else
+        {
+            /* Ruhestrom: Countdown bis Abschaltung */
+            if (s_idle_below_since_us == 0)
+            {
+                s_idle_below_since_us = now_us;
+            }
+            uint32_t delay_s = (s_bridge_cfg.idle_shutdown_delay_s > 0) ? s_bridge_cfg.idle_shutdown_delay_s : 60u;
+            int64_t delay_us = (int64_t)delay_s * 1000000LL;
+            int64_t elapsed_us = now_us - s_idle_below_since_us;
+
+            if (elapsed_us >= delay_us)
+            {
+                /* Verzögerung abgelaufen – jetzt wirklich abschalten */
+                s_unlock_idle_pending = false;
+                s_idle_below_since_us = 0;
+                lv_obj_set_style_bg_color(s_ui.unlock_indicator, lv_color_hex(0xEF4444), 0);
+                lv_obj_clear_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_HIDDEN);
+                if (s_ui.unlock_text_label)
+                {
+                    lv_label_set_text(s_ui.unlock_text_label, LV_SYMBOL_CLOSE " Gesperrt");
+                }
+                ESP_LOGI(TAG, "Idle-Shutdown: Relais abgeschaltet nach %lu s Ruhestrom", (unsigned long)delay_s);
+                s_last_heartbeat_us = 0;
+                if (s_ui.revoke_unlock_btn)
+                {
+                    lv_obj_add_flag(s_ui.revoke_unlock_btn, LV_OBJ_FLAG_HIDDEN);
+                }
+                if (s_ui.login_btn)
+                {
+                    lv_obj_clear_flag(s_ui.login_btn, LV_OBJ_FLAG_HIDDEN);
+                }
+                /* PCF: Rote LED an wenn verbunden+angemeldet, sonst alles aus */
+                pcf8574_set_outputs((s_wifi_has_ip && auth_has_token())
+                                        ? (uint8_t)(PCF_OUTPUT_MASK & ~(1u << PCF_PIN_LED_RED))
+                                        : PCF_OUTPUT_MASK);
+            }
+            else
+            {
+                /* Noch innerhalb der Wartezeit – Countdown anzeigen */
+                int remaining_sec = (int)((delay_us - elapsed_us) / 1000000LL) + 1;
+                char idle_buf[64];
+                snprintf(idle_buf, sizeof(idle_buf), LV_SYMBOL_WARNING " Abschaltung in %ds", remaining_sec);
+                lv_obj_set_style_bg_color(s_ui.unlock_indicator, lv_color_hex(0xF97316), 0);
+                lv_obj_clear_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_HIDDEN);
+                if (s_ui.unlock_text_label)
+                {
+                    lv_label_set_text(s_ui.unlock_text_label, idle_buf);
+                }
+            }
+        }
+        return;
+    }
+
     int64_t until = s_unlock_until_us;
 
-    if (until <= 0) {
+    if (until <= 0)
+    {
         /* Not unlocked — red */
         lv_obj_set_style_bg_color(s_ui.unlock_indicator, lv_color_hex(0xEF4444), 0);
         lv_obj_clear_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_HIDDEN);
-        if (s_ui.unlock_text_label) {
+        if (s_ui.unlock_text_label)
+        {
             lv_label_set_text(s_ui.unlock_text_label, LV_SYMBOL_CLOSE " Gesperrt");
         }
-        if (s_ui.revoke_unlock_btn) {
+        if (s_ui.revoke_unlock_btn)
+        {
             lv_obj_add_flag(s_ui.revoke_unlock_btn, LV_OBJ_FLAG_HIDDEN);
         }
-        if (s_ui.login_btn) {
+        if (s_ui.login_btn)
+        {
             lv_obj_clear_flag(s_ui.login_btn, LV_OBJ_FLAG_HIDDEN);
         }
         /* PCF: Rote LED an wenn verbunden+angemeldet, sonst alles aus */
         pcf8574_set_outputs((s_wifi_has_ip && auth_has_token())
-            ? (uint8_t)(PCF_OUTPUT_MASK & ~(1u << PCF_PIN_LED_RED))
-            : PCF_OUTPUT_MASK);
+                                ? (uint8_t)(PCF_OUTPUT_MASK & ~(1u << PCF_PIN_LED_RED))
+                                : PCF_OUTPUT_MASK);
         return;
     }
 
     int64_t remaining_us = until - now_us;
-    if (remaining_us <= 0) {
-        /* Expired — reset to locked */
+    if (remaining_us <= 0)
+    {
+        /* Timer abgelaufen */
         s_unlock_until_us = 0;
+
+        if (s_bridge_cfg.idle_detection_enabled && s_bridge_cfg.idle_current > 0.0f)
+        {
+            /* Idle-Erkennung aktiv: Relay erstmal behalten, Pending-Prüfung starten */
+            s_unlock_idle_pending = true;
+            s_idle_below_since_us = 0;
+            ESP_LOGI(TAG, "Unlock timer expired – Idle-Pending aktiviert (delay=%lu s)",
+                     (unsigned long)((s_bridge_cfg.idle_shutdown_delay_s > 0) ? s_bridge_cfg.idle_shutdown_delay_s : 60u));
+            return;
+        }
+
+        /* Keine Idle-Erkennung – sofort sperren */
         lv_obj_set_style_bg_color(s_ui.unlock_indicator, lv_color_hex(0xEF4444), 0);
         lv_obj_clear_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_HIDDEN);
-        if (s_ui.unlock_text_label) {
+        if (s_ui.unlock_text_label)
+        {
             lv_label_set_text(s_ui.unlock_text_label, LV_SYMBOL_CLOSE " Gesperrt");
         }
         ESP_LOGI(TAG, "Unlock expired");
         /* Force immediate heartbeat so server sees the status change */
         s_last_heartbeat_us = 0;
-        if (s_ui.revoke_unlock_btn) {
+        if (s_ui.revoke_unlock_btn)
+        {
             lv_obj_add_flag(s_ui.revoke_unlock_btn, LV_OBJ_FLAG_HIDDEN);
         }
-        if (s_ui.login_btn) {
+        if (s_ui.login_btn)
+        {
             lv_obj_clear_flag(s_ui.login_btn, LV_OBJ_FLAG_HIDDEN);
         }
         /* PCF: Rote LED an wenn verbunden+angemeldet, sonst alles aus */
         pcf8574_set_outputs((s_wifi_has_ip && auth_has_token())
-            ? (uint8_t)(PCF_OUTPUT_MASK & ~(1u << PCF_PIN_LED_RED))
-            : PCF_OUTPUT_MASK);
+                                ? (uint8_t)(PCF_OUTPUT_MASK & ~(1u << PCF_PIN_LED_RED))
+                                : PCF_OUTPUT_MASK);
         return;
     }
 
@@ -2738,34 +3769,48 @@ static void unlock_timer_cb(lv_timer_t *timer)
     snprintf(time_buf, sizeof(time_buf), LV_SYMBOL_OK " %d:%02d", mins, secs);
 
     int64_t two_min_us = (int64_t)2 * 60 * 1000000;
-    if (remaining_us < two_min_us) {
+    if (remaining_us < two_min_us)
+    {
         /* Less than 2 min — yellow, blink */
         static bool blink_on = true;
         blink_on = !blink_on;
         lv_obj_set_style_bg_color(s_ui.unlock_indicator, lv_color_hex(0xEAB308), 0);
-        if (blink_on) {
+        if (blink_on)
+        {
             lv_obj_clear_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_HIDDEN);
-        } else {
+        }
+        else
+        {
             lv_obj_add_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_HIDDEN);
         }
-        /* PCF: Gruene LED blinkt im Gleichlauf; Relais bleibt permanent aktiv */
-        pcf8574_set_outputs(blink_on
-            ? (uint8_t)(PCF_OUTPUT_MASK & ~((1u << PCF_PIN_LED_GREEN) | (1u << PCF_PIN_RELAY)))
-            : (uint8_t)(PCF_OUTPUT_MASK & ~(1u << PCF_PIN_RELAY)));
-    } else {
+        /* PCF: Relais dauerhaft aktiv; LED blinkt mit – Relay-Bit aendert sich nie → kein Glitch */
+        if (blink_on)
+        {
+            pcf8574_set_outputs((uint8_t)(PCF_OUTPUT_MASK & ~((1u << PCF_PIN_LED_GREEN) | (1u << PCF_PIN_RELAY))));
+        }
+        else
+        {
+            pcf8574_set_outputs((uint8_t)(PCF_OUTPUT_MASK & ~(1u << PCF_PIN_RELAY)));
+        }
+    }
+    else
+    {
         /* Unlocked — green */
         lv_obj_set_style_bg_color(s_ui.unlock_indicator, lv_color_hex(0x22C55E), 0);
         lv_obj_clear_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_HIDDEN);
         /* PCF: Gruene LED an, Relais aktiv */
         pcf8574_set_outputs((uint8_t)(PCF_OUTPUT_MASK & ~((1u << PCF_PIN_LED_GREEN) | (1u << PCF_PIN_RELAY))));
     }
-    if (s_ui.unlock_text_label) {
+    if (s_ui.unlock_text_label)
+    {
         lv_label_set_text(s_ui.unlock_text_label, time_buf);
     }
-    if (s_ui.revoke_unlock_btn) {
+    if (s_ui.revoke_unlock_btn)
+    {
         lv_obj_clear_flag(s_ui.revoke_unlock_btn, LV_OBJ_FLAG_HIDDEN);
     }
-    if (s_ui.login_btn) {
+    if (s_ui.login_btn)
+    {
         lv_obj_add_flag(s_ui.login_btn, LV_OBJ_FLAG_HIDDEN);
     }
 }
@@ -2775,94 +3820,153 @@ static void revoke_unlock_event_cb(lv_event_t *event)
 {
     LV_UNUSED(event);
     s_unlock_until_us = 0;
+    s_unlock_idle_pending = false;
+    s_idle_below_since_us = 0;
     ESP_LOGI(TAG, "Unlock revoked by user");
     s_last_heartbeat_us = 0;
 }
 
-/* Idle-Strom messen via ADS1115 (Kanal 0).
- * Fuehrt IDLE_MEASURE_SAMPLES Single-Shot-Messungen durch, sortiert die Werte
- * und bildet einen Trimmed-Mean (ohne kleinstes und groesstes Ergebnis).
- * Rueckgabe: Durchschnitts-Spannung in mV (1 LSB = ADS_LSB_uV µV, PGA ±2.048 V).
- * Negativer Rueckgabewert = ADS1115 nicht verfuegbar. */
-#define IDLE_MEASURE_SAMPLES   5
-#define ADS_LSB_uV             62.5f  /* 2048 mV / 32768 LSB */
-static float measure_idle_current_mV(void)
-{
-    if (s_ads1115_dev == NULL) {
-        return -1.0f;
-    }
-    int32_t readings[IDLE_MEASURE_SAMPLES];
-    for (int i = 0; i < IDLE_MEASURE_SAMPLES; i++) {
-        readings[i] = (int32_t)ads1115_read_channel(0);
-        /* ads1115_read_channel enthaelt bereits ~15 ms Wartezeit */
-    }
-    /* Insertion-Sort aufsteigend */
-    for (int i = 1; i < IDLE_MEASURE_SAMPLES; i++) {
-        int32_t key = readings[i];
-        int j = i - 1;
-        while ((j >= 0) && (readings[j] > key)) {
-            readings[j + 1] = readings[j];
-            j--;
-        }
-        readings[j + 1] = key;
-    }
-    /* Trimmed Mean: erstes (min) und letztes (max) verwerfen */
-    int32_t sum = 0;
-    for (int i = 1; i < (IDLE_MEASURE_SAMPLES - 1); i++) {
-        sum += readings[i];
-    }
-    float avg_raw = (float)sum / (float)(IDLE_MEASURE_SAMPLES - 2);
-    return avg_raw * ADS_LSB_uV / 1000.0f;  /* µV → mV */
-}
-
-/* Hintergrund-Task fuer Idle-Strommessung: laeuft ausserhalb des LVGL-Tasks
- * (Gesamtdauer ~5 × 15 ms = 75 ms), aktualisiert UI und loest Heartbeat aus. */
+/* Hintergrund-Task fuer Idle-Strommessung: leitet Wert aus der kontinuierlichen
+ * RMS-Messung ab (current_measure_task). Wartet kurz auf frische Daten, mittelt
+ * dann 5 Snapshots im Abstand von 100 ms und speichert den Ergebnis-Strom [A]. */
+#define IDLE_SNAPSHOT_COUNT 5
 static void idle_measure_task(void *arg)
 {
     (void)arg;
-    float mV = measure_idle_current_mV();
-    s_idle_current_measured_mV = mV;
-    ESP_LOGI(TAG, "Idle current measured: %.3f mV (ADS1115 ch0)", mV);
-    /* Persistent speichern: Wert in Bridge-Config schreiben und NVS-Save triggern */
-    if (mV >= 0.0f) {
-        s_bridge_cfg.idle_current = mV;
-        s_bridge_cfg_updated = true;
+
+    if (s_ads1115_dev == NULL)
+    {
+        s_idle_current_measured_mV = -1.0f;
+        ESP_LOGW(TAG, "idle_measure_task: ADS1115 nicht verfuegbar");
+        vTaskDelete(NULL);
+        return;
     }
 
-    char msg[72];
-    lv_color_t col;
-    if (mV < 0.0f) {
-        snprintf(msg, sizeof(msg), "Messung fehlgeschlagen (ADS1115)");
-        col = lv_color_hex(0xFCA5A5);
-    } else {
-        snprintf(msg, sizeof(msg), "Idle: %.2f mV  (wird uebermittelt)", mV);
-        col = lv_color_hex(0x86EFAC);
+    /* Kurz warten, damit current_measure_task frische Werte geliefert hat */
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    float sum = 0.0f;
+    for (int i = 0; i < IDLE_SNAPSHOT_COUNT; i++)
+    {
+        sum += s_current_rms_a;
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
-    if (s_ui.status_bridge_label && bsp_display_lock(100)) {
+    float rms_a = sum / (float)IDLE_SNAPSHOT_COUNT;
+    s_idle_current_measured_mV = rms_a; /* Einheit jetzt [A], Variablenname historisch */
+    ESP_LOGI(TAG, "Idle current measured: %.3f A (RMS, kontinuierlich)", (double)rms_a);
+
+    /* Persistent speichern */
+    s_bridge_cfg.idle_current = rms_a;
+    s_bridge_cfg_updated = true;
+
+    char msg[72];
+    snprintf(msg, sizeof(msg), "Idle: %.3f A RMS  (wird uebermittelt)", (double)rms_a);
+    if (s_ui.status_bridge_label && bsp_display_lock(100))
+    {
         lv_label_set_text(s_ui.status_bridge_label, msg);
-        lv_obj_set_style_text_color(s_ui.status_bridge_label, col, 0);
+        lv_obj_set_style_text_color(s_ui.status_bridge_label, lv_color_hex(0x86EFAC), 0);
         bsp_display_unlock();
     }
-    /* Heartbeat sofort auslösen, damit der Messwert zum Server uebertragen wird */
-    if (mV >= 0.0f) {
-        s_last_heartbeat_us = 0;
+    /* Heartbeat sofort ausloesen */
+    s_last_heartbeat_us = 0;
+    vTaskDelete(NULL);
+}
+
+/* Hintergrund-Task fuer Strom-Nullpunkt-Kalibrierung:
+ * Misst den DC-Mittelwert der Sensorspannung bei stromlosem Zustand
+ * und speichert ihn als neuen Nullpunkt (s_current_zero_mv) im NVS. */
+#define ZERO_CAL_SAMPLES 256
+static void zero_calibrate_task(void *arg)
+{
+    (void)arg;
+
+    if (s_ads1115_dev == NULL)
+    {
+        ESP_LOGW(TAG, "zero_calibrate_task: ADS1115 nicht verfuegbar");
+        if (s_ui.status_bridge_label && bsp_display_lock(50))
+        {
+            lv_label_set_text(s_ui.status_bridge_label, "Kalibrierung: ADS1115 fehlt");
+            lv_obj_set_style_text_color(s_ui.status_bridge_label, lv_color_hex(0xFCA5A5), 0);
+            bsp_display_unlock();
+        }
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Continuous-Mode sicherstellen, kurz einschwingen lassen */
+    ads1115_start_continuous();
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    double sum = 0.0;
+    for (int i = 0; i < ZERO_CAL_SAMPLES; i++)
+    {
+        int16_t raw = ads1115_read_continuous();
+        float v_mv = (float)raw * ADS_LSB_uV / 1000.0f;
+        sum += (double)v_mv;
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    float zero_mv = (float)(sum / ZERO_CAL_SAMPLES);
+
+    s_current_zero_mv = zero_mv;
+    s_bridge_cfg.current_zero_mv = zero_mv;
+    /* Versionierungsunabhaengig speichern – bleibt auch nach Firmware-Update erhalten */
+    zero_cal_save(zero_mv);
+    bridge_cfg_save(&s_bridge_cfg);
+
+    ESP_LOGI(TAG, "Strom-Nullpunkt kalibriert: %.3f mV (Soll: %.1f mV)",
+             (double)zero_mv, (double)MCS1806_OFFSET_MV);
+
+    char msg[80];
+    snprintf(msg, sizeof(msg), "Nullpunkt: %.1f mV (Delta: %+.1f mV) - gespeichert",
+             (double)zero_mv, (double)(zero_mv - MCS1806_OFFSET_MV));
+    if (s_ui.status_bridge_label && bsp_display_lock(100))
+    {
+        lv_label_set_text(s_ui.status_bridge_label, msg);
+        lv_obj_set_style_text_color(s_ui.status_bridge_label, lv_color_hex(0x86EFAC), 0);
+        bsp_display_unlock();
     }
     vTaskDelete(NULL);
+}
+
+/* Button-Callback: startet Nullpunkt-Kalibrierung */
+static void calibrate_zero_event_cb(lv_event_t *event)
+{
+    LV_UNUSED(event);
+    if (s_ui.status_bridge_label && bsp_display_lock(50))
+    {
+        lv_label_set_text(s_ui.status_bridge_label, "Nullpunkt wird kalibriert...");
+        lv_obj_set_style_text_color(s_ui.status_bridge_label, lv_color_hex(0xFDE68A), 0);
+        bsp_display_unlock();
+    }
+    BaseType_t ok = xTaskCreatePinnedToCore(zero_calibrate_task, "zero_cal", 4096, NULL, 3, NULL, AUTH_TASK_CORE_ID);
+    if (ok != pdPASS)
+    {
+        ESP_LOGE(TAG, "zero_calibrate_task creation failed");
+        if (s_ui.status_bridge_label && bsp_display_lock(50))
+        {
+            lv_label_set_text(s_ui.status_bridge_label, "Task-Fehler");
+            lv_obj_set_style_text_color(s_ui.status_bridge_label, lv_color_hex(0xFCA5A5), 0);
+            bsp_display_unlock();
+        }
+    }
 }
 
 /* Button-Callback: startet Idle-Strommessung als Hintergrund-Task */
 static void measure_idle_current_event_cb(lv_event_t *event)
 {
     LV_UNUSED(event);
-    if (s_ui.status_bridge_label && bsp_display_lock(50)) {
+    if (s_ui.status_bridge_label && bsp_display_lock(50))
+    {
         lv_label_set_text(s_ui.status_bridge_label, "Idle-Strom wird gemessen...");
         lv_obj_set_style_text_color(s_ui.status_bridge_label, lv_color_hex(0xFDE68A), 0);
         bsp_display_unlock();
     }
     BaseType_t ok = xTaskCreatePinnedToCore(idle_measure_task, "idle_meas", 4096, NULL, 3, NULL, AUTH_TASK_CORE_ID);
-    if (ok != pdPASS) {
+    if (ok != pdPASS)
+    {
         ESP_LOGE(TAG, "idle_measure_task creation failed");
-        if (s_ui.status_bridge_label && bsp_display_lock(50)) {
+        if (s_ui.status_bridge_label && bsp_display_lock(50))
+        {
             lv_label_set_text(s_ui.status_bridge_label, "Task-Fehler");
             lv_obj_set_style_text_color(s_ui.status_bridge_label, lv_color_hex(0xFCA5A5), 0);
             bsp_display_unlock();
@@ -2985,6 +4089,22 @@ static void create_ui(void)
     lv_obj_set_width(s_ui.nfc_uid_label, lv_pct(100));
 #endif
 
+    /* Reservierungs-Banner — amber, versteckt bis Reservierung vorhanden */
+    s_ui.reservation_banner = lv_obj_create(s_ui.start_container);
+    lv_obj_set_width(s_ui.reservation_banner, lv_pct(100));
+    lv_obj_set_height(s_ui.reservation_banner, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(s_ui.reservation_banner, lv_color_hex(0x78350F), 0);
+    lv_obj_set_style_border_color(s_ui.reservation_banner, lv_color_hex(0xFBBF24), 0);
+    lv_obj_set_style_border_width(s_ui.reservation_banner, 1, 0);
+    lv_obj_set_style_radius(s_ui.reservation_banner, 10, 0);
+    lv_obj_set_style_pad_all(s_ui.reservation_banner, 8, 0);
+    lv_obj_add_flag(s_ui.reservation_banner, LV_OBJ_FLAG_HIDDEN);
+    s_ui.reservation_label = lv_label_create(s_ui.reservation_banner);
+    lv_label_set_text(s_ui.reservation_label, "");
+    lv_label_set_long_mode(s_ui.reservation_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_ui.reservation_label, lv_pct(100));
+    lv_obj_set_style_text_color(s_ui.reservation_label, lv_color_hex(0xFDE68A), 0);
+
     s_ui.login_btn = create_primary_button(s_ui.start_container, "HSD Login");
     lv_obj_add_event_cb(s_ui.login_btn, login_open_event_cb, LV_EVENT_CLICKED, NULL);
 
@@ -3004,8 +4124,8 @@ static void create_ui(void)
 
 #if !ENABLE_NFC
     /* NFC simulation buttons */
-    static const char *sim_uid_lars  = "044F3E6A174F80";
-    static const char *sim_uid_ben   = "11223344";
+    static const char *sim_uid_lars = "044F3E6A174F80";
+    static const char *sim_uid_ben = "11223344";
     static const char *sim_uid_hsd = "AABBCCDD";
 
     lv_obj_t *sim_row = lv_obj_create(s_ui.start_container);
@@ -3069,8 +4189,7 @@ static void create_ui(void)
         "1", "2", "3", "\n",
         "4", "5", "6", "\n",
         "7", "8", "9", "\n",
-        "CLR", "0", LV_SYMBOL_BACKSPACE, ""
-    };
+        "CLR", "0", LV_SYMBOL_BACKSPACE, ""};
 
     s_ui.pin_pad = lv_buttonmatrix_create(s_ui.pin_container);
     lv_buttonmatrix_set_map(s_ui.pin_pad, pin_map);
@@ -3241,6 +4360,16 @@ static void create_ui(void)
     s_ui.wifi_ssid_dropdown = lv_dropdown_create(s_ui.wifi_cfg_page);
     lv_obj_set_width(s_ui.wifi_ssid_dropdown, lv_pct(100));
     lv_dropdown_set_options(s_ui.wifi_ssid_dropdown, "Kein Netzwerk gefunden");
+    /* Scroll-Snap auf der Dropdown-Liste: verhindert, dass beim Scrollen
+     * versehentlich ein Eintrag ausgewaehlt wird, da die Liste nach dem
+     * Loslassen immer an eine Eintragskante einrastet. */
+    {
+        lv_obj_t *dd_list = lv_dropdown_get_list(s_ui.wifi_ssid_dropdown);
+        if (dd_list)
+        {
+            lv_obj_set_scroll_snap_y(dd_list, LV_SCROLL_SNAP_START);
+        }
+    }
 
     lv_obj_t *wifi_scan_btn = create_primary_button(s_ui.wifi_cfg_page, "WLAN Scan");
     lv_obj_add_event_cb(wifi_scan_btn, wifi_scan_event_cb, LV_EVENT_CLICKED, NULL);
@@ -3296,7 +4425,8 @@ static void create_ui(void)
 
     s_ui.wifi_eap_sw = lv_switch_create(eap_row);
     lv_obj_set_style_bg_color(s_ui.wifi_eap_sw, lv_color_hex(0x2563EB), LV_PART_INDICATOR | LV_STATE_CHECKED);
-    if (s_wifi_cfg.eap_enabled) {
+    if (s_wifi_cfg.eap_enabled)
+    {
         lv_obj_add_state(s_ui.wifi_eap_sw, LV_STATE_CHECKED);
     }
     lv_obj_add_event_cb(s_ui.wifi_eap_sw, wifi_eap_toggle_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
@@ -3311,7 +4441,8 @@ static void create_ui(void)
     lv_obj_set_style_pad_row(s_ui.wifi_eap_cont, 6, 0);
     lv_obj_set_layout(s_ui.wifi_eap_cont, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(s_ui.wifi_eap_cont, LV_FLEX_FLOW_COLUMN);
-    if (!s_wifi_cfg.eap_enabled) {
+    if (!s_wifi_cfg.eap_enabled)
+    {
         lv_obj_add_flag(s_ui.wifi_eap_cont, LV_OBJ_FLAG_HIDDEN);
     }
 
@@ -3348,7 +4479,8 @@ static void create_ui(void)
 
     s_ui.wifi_dhcp_sw = lv_switch_create(dhcp_row);
     lv_obj_set_style_bg_color(s_ui.wifi_dhcp_sw, lv_color_hex(0x2563EB), LV_PART_INDICATOR | LV_STATE_CHECKED);
-    if (s_wifi_cfg.dhcp_enabled) {
+    if (s_wifi_cfg.dhcp_enabled)
+    {
         lv_obj_add_state(s_ui.wifi_dhcp_sw, LV_STATE_CHECKED);
     }
     lv_obj_add_event_cb(s_ui.wifi_dhcp_sw, wifi_dhcp_toggle_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
@@ -3363,7 +4495,8 @@ static void create_ui(void)
     lv_obj_set_style_pad_row(s_ui.wifi_static_ip_cont, 6, 0);
     lv_obj_set_layout(s_ui.wifi_static_ip_cont, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(s_ui.wifi_static_ip_cont, LV_FLEX_FLOW_COLUMN);
-    if (s_wifi_cfg.dhcp_enabled) {
+    if (s_wifi_cfg.dhcp_enabled)
+    {
         lv_obj_add_flag(s_ui.wifi_static_ip_cont, LV_OBJ_FLAG_HIDDEN);
     }
 
@@ -3421,10 +4554,26 @@ static void create_ui(void)
     lv_obj_clear_flag(s_ui.wifi_status_page, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_ui.wifi_status_page, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_t *status_title = lv_label_create(s_ui.wifi_status_page);
+    /* Titelzeile: "Board Status" links, Uhrzeit rechts */
+    lv_obj_t *status_title_row = lv_obj_create(s_ui.wifi_status_page);
+    lv_obj_set_width(status_title_row, lv_pct(100));
+    lv_obj_set_height(status_title_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(status_title_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(status_title_row, 0, 0);
+    lv_obj_set_style_pad_all(status_title_row, 0, 0);
+    lv_obj_set_layout(status_title_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(status_title_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(status_title_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *status_title = lv_label_create(status_title_row);
     lv_label_set_text(status_title, "Board Status");
     lv_obj_set_style_text_font(status_title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(status_title, lv_color_hex(0xF9FAFB), 0);
+
+    s_ui.status_clock_label = lv_label_create(status_title_row);
+    lv_label_set_text(s_ui.status_clock_label, "-- NTP nicht sync. --");
+    lv_obj_set_style_text_font(s_ui.status_clock_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_ui.status_clock_label, lv_color_hex(0x94A3B8), 0);
 
     /* Sub-tab button row */
     lv_obj_t *tab_row = lv_obj_create(s_ui.wifi_status_page);
@@ -3469,6 +4618,17 @@ static void create_ui(void)
     lv_obj_set_style_text_color(tab_sys_lbl, lv_color_hex(0xEFF6FF), 0);
     lv_obj_center(tab_sys_lbl);
     lv_obj_add_event_cb(s_ui.tab_sys_btn, status_tab_system_cb, LV_EVENT_CLICKED, NULL);
+
+    s_ui.tab_cal_btn = lv_button_create(tab_row);
+    lv_obj_set_flex_grow(s_ui.tab_cal_btn, 1);
+    lv_obj_set_height(s_ui.tab_cal_btn, 36);
+    lv_obj_set_style_radius(s_ui.tab_cal_btn, 10, 0);
+    lv_obj_set_style_bg_color(s_ui.tab_cal_btn, lv_color_hex(0x374151), 0);
+    lv_obj_t *tab_cal_lbl = lv_label_create(s_ui.tab_cal_btn);
+    lv_label_set_text(tab_cal_lbl, "Messung");
+    lv_obj_set_style_text_color(tab_cal_lbl, lv_color_hex(0xEFF6FF), 0);
+    lv_obj_center(tab_cal_lbl);
+    lv_obj_add_event_cb(s_ui.tab_cal_btn, status_tab_cal_cb, LV_EVENT_CLICKED, NULL);
 
     /* Scrollbarer Inhaltsbereich fuer Tab-Content – Title und Tab-Leiste bleiben oben fixiert */
     lv_obj_t *tab_scroll_area = lv_obj_create(s_ui.wifi_status_page);
@@ -3520,9 +4680,26 @@ static void create_ui(void)
     lv_obj_set_width(s_ui.status_bridge_label, lv_pct(100));
     lv_obj_set_style_text_color(s_ui.status_bridge_label, lv_color_hex(0xCBD5E1), 0);
 
-    s_ui.measure_idle_btn = create_primary_button(s_ui.status_tab_bridge, LV_SYMBOL_CHARGE " Idle-Strom messen");
+    /* --- System sub-tab --- */
+    /* --- Kalibrierung/Messung sub-tab --- */
+    s_ui.status_tab_cal = lv_obj_create(tab_scroll_area);
+    lv_obj_set_width(s_ui.status_tab_cal, lv_pct(100));
+    lv_obj_set_height(s_ui.status_tab_cal, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(s_ui.status_tab_cal, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_ui.status_tab_cal, 0, 0);
+    lv_obj_set_style_pad_all(s_ui.status_tab_cal, 0, 0);
+    lv_obj_set_style_pad_row(s_ui.status_tab_cal, 10, 0);
+    lv_obj_set_layout(s_ui.status_tab_cal, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(s_ui.status_tab_cal, LV_FLEX_FLOW_COLUMN);
+    lv_obj_add_flag(s_ui.status_tab_cal, LV_OBJ_FLAG_HIDDEN);
+
+    s_ui.measure_idle_btn = create_primary_button(s_ui.status_tab_cal, LV_SYMBOL_CHARGE " Idle-Strom messen");
     lv_obj_set_style_bg_color(s_ui.measure_idle_btn, lv_color_hex(0x0F766E), 0);
     lv_obj_add_event_cb(s_ui.measure_idle_btn, measure_idle_current_event_cb, LV_EVENT_CLICKED, NULL);
+
+    s_ui.calibrate_zero_btn = create_primary_button(s_ui.status_tab_cal, LV_SYMBOL_SETTINGS " Strom-Nullpunkt kalibrieren");
+    lv_obj_set_style_bg_color(s_ui.calibrate_zero_btn, lv_color_hex(0x78350F), 0);
+    lv_obj_add_event_cb(s_ui.calibrate_zero_btn, calibrate_zero_event_cb, LV_EVENT_CLICKED, NULL);
 
     /* --- System sub-tab --- */
     s_ui.status_tab_system = lv_obj_create(tab_scroll_area);
@@ -3588,20 +4765,24 @@ static void create_ui(void)
 
     /* Unlock status indicator (top-right) */
     s_ui.unlock_indicator = lv_obj_create(screen);
-    lv_obj_set_size(s_ui.unlock_indicator, 150, 44);
+    lv_obj_set_size(s_ui.unlock_indicator, 154, LV_SIZE_CONTENT);
     lv_obj_align(s_ui.unlock_indicator, LV_ALIGN_TOP_RIGHT, -12, 12);
     lv_obj_set_style_radius(s_ui.unlock_indicator, 8, 0);
     lv_obj_set_style_bg_color(s_ui.unlock_indicator, lv_color_hex(0xEF4444), 0);
     lv_obj_set_style_bg_opa(s_ui.unlock_indicator, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_ui.unlock_indicator, 0, 0);
-    lv_obj_set_style_pad_all(s_ui.unlock_indicator, 0, 0);
+    lv_obj_set_style_pad_hor(s_ui.unlock_indicator, 6, 0);
+    lv_obj_set_style_pad_ver(s_ui.unlock_indicator, 7, 0);
     lv_obj_clear_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_ui.unlock_indicator, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_ui.unlock_indicator, unlock_indicator_click_cb, LV_EVENT_CLICKED, NULL);
 
     s_ui.unlock_text_label = lv_label_create(s_ui.unlock_indicator);
+    lv_label_set_long_mode(s_ui.unlock_text_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_ui.unlock_text_label, 142);
     lv_label_set_text(s_ui.unlock_text_label, LV_SYMBOL_CLOSE " Gesperrt");
     lv_obj_set_style_text_color(s_ui.unlock_text_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_align(s_ui.unlock_text_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_center(s_ui.unlock_text_label);
 
     lv_timer_create(auth_result_timer_cb, 120, NULL);
@@ -3627,25 +4808,27 @@ static void create_ui(void)
 /* Baut ein PN532-I2C-Frame und sendet es an den Chip */
 static esp_err_t pn532_write_frame(const uint8_t *cmd, size_t cmd_len)
 {
-    if ((cmd_len + 8u) > 32u) {
+    if ((cmd_len + 8u) > 32u)
+    {
         return ESP_ERR_INVALID_SIZE;
     }
     uint8_t frame[32];
     size_t idx = 0;
-    frame[idx++] = 0x00u; /* Preamble */
-    frame[idx++] = 0x00u; /* Start Code 1 */
-    frame[idx++] = 0xFFu; /* Start Code 2 */
+    frame[idx++] = 0x00u;                  /* Preamble */
+    frame[idx++] = 0x00u;                  /* Start Code 1 */
+    frame[idx++] = 0xFFu;                  /* Start Code 2 */
     uint8_t len = (uint8_t)(cmd_len + 1u); /* LEN = TFI + data */
     frame[idx++] = len;
     frame[idx++] = (uint8_t)(0x100u - len); /* LCS */
     frame[idx++] = PN532_HOSTTOPN532;       /* TFI: Host -> PN532 */
     uint8_t dcs = PN532_HOSTTOPN532;
-    for (size_t i = 0; i < cmd_len; i++) {
+    for (size_t i = 0; i < cmd_len; i++)
+    {
         frame[idx++] = cmd[i];
         dcs += cmd[i];
     }
     frame[idx++] = (uint8_t)(0x100u - dcs); /* DCS */
-    frame[idx++] = 0x00u; /* Postamble */
+    frame[idx++] = 0x00u;                   /* Postamble */
     return i2c_master_transmit(s_pn532_dev, frame, idx, PN532_I2C_RX_TIMEOUT_MS);
 }
 
@@ -3654,11 +4837,13 @@ static esp_err_t pn532_wait_ready(int timeout_ms)
 {
     uint8_t status = 0;
     int elapsed = 0;
-    while (elapsed < timeout_ms) {
+    while (elapsed < timeout_ms)
+    {
         /* Kurzer Timeout: Status-Byte ist sofort verfuegbar wenn bereit,
          * kein Clock-Stretching erwartet → schnell freigeben fuer GT911 */
         esp_err_t err = i2c_master_receive(s_pn532_dev, &status, 1, PN532_STATUS_POLL_TIMEOUT_MS);
-        if ((err == ESP_OK) && (status & 0x01u)) {
+        if ((err == ESP_OK) && (status & 0x01u))
+        {
             return ESP_OK;
         }
         /* Laengeres Intervall: GT911 bekommt genug Bus-Fenster zwischen Polls */
@@ -3674,26 +4859,32 @@ static esp_err_t pn532_read_response(uint8_t *buf, size_t buf_len, size_t *out_l
 {
     uint8_t tmp[64] = {0};
     size_t read_sz = buf_len + 10u;
-    if (read_sz > sizeof(tmp)) {
+    if (read_sz > sizeof(tmp))
+    {
         read_sz = sizeof(tmp);
     }
     esp_err_t err = i2c_master_receive(s_pn532_dev, tmp, read_sz, PN532_I2C_RX_TIMEOUT_MS);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         return err;
     }
     /* tmp[0]=status, tmp[3]=0xFF markiert gültigen Frame-Start */
-    if ((read_sz < 9u) || (tmp[3] != 0xFFu)) {
+    if ((read_sz < 9u) || (tmp[3] != 0xFFu))
+    {
         return ESP_ERR_INVALID_RESPONSE;
     }
     uint8_t frame_len = tmp[4]; /* TFI + CMD + Payload */
     size_t data_len = (frame_len >= 2u) ? (size_t)(frame_len - 2u) : 0u;
-    if (out_len) {
+    if (out_len)
+    {
         *out_len = data_len;
     }
-    if (data_len > buf_len) {
+    if (data_len > buf_len)
+    {
         data_len = buf_len;
     }
-    if (data_len > 0u) {
+    if (data_len > 0u)
+    {
         memcpy(buf, &tmp[8], data_len);
     }
     return ESP_OK;
@@ -3712,20 +4903,23 @@ static void pn532_wakeup(void)
 static esp_err_t pn532_sam_config(void)
 {
     /* Cmd=0x14, Normalmodus, Timeout=0x14 (20x50ms=1s), no IRQ */
-    const uint8_t cmd[] = { PN532_CMD_SAMCONFIGURATION, 0x01u, 0x14u, 0x00u };
+    const uint8_t cmd[] = {PN532_CMD_SAMCONFIGURATION, 0x01u, 0x14u, 0x00u};
     esp_err_t err = pn532_write_frame(cmd, sizeof(cmd));
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         return err;
     }
     vTaskDelay(pdMS_TO_TICKS(10)); /* PN532 parst Command, bevor erstem Status-Poll */
     err = pn532_wait_ready(PN532_ACK_TIMEOUT_MS);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         return err;
     }
     uint8_t ack[7] = {0};
     i2c_master_receive(s_pn532_dev, ack, sizeof(ack), PN532_I2C_RX_TIMEOUT_MS);
     err = pn532_wait_ready(PN532_CMD_TIMEOUT_MS);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         return err;
     }
     uint8_t resp[4] = {0};
@@ -3739,40 +4933,47 @@ static esp_err_t pn532_list_passive_target(uint8_t *uid_out, uint8_t *uid_len_ou
 {
     *uid_len_out = 0;
     /* MaxTg=1, BrTy=0x00 = 106kbps ISO14443A */
-    const uint8_t cmd[] = { PN532_CMD_INLISTPASSIVETARGET, 0x01u, 0x00u };
+    const uint8_t cmd[] = {PN532_CMD_INLISTPASSIVETARGET, 0x01u, 0x00u};
     esp_err_t err = pn532_write_frame(cmd, sizeof(cmd));
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         return err;
     }
     vTaskDelay(pdMS_TO_TICKS(10)); /* PN532 parst Command, bevor erstem Status-Poll */
     /* Warten auf ACK vom PN532 */
     err = pn532_wait_ready(PN532_ACK_TIMEOUT_MS);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         return ESP_ERR_TIMEOUT;
     }
     uint8_t ack[7] = {0};
     i2c_master_receive(s_pn532_dev, ack, sizeof(ack), PN532_I2C_RX_TIMEOUT_MS);
     /* Warten auf Scan-Ergebnis (Karte gefunden oder interner Timeout) */
     err = pn532_wait_ready(PN532_SCAN_TIMEOUT_MS);
-    if (err == ESP_ERR_TIMEOUT) {
+    if (err == ESP_ERR_TIMEOUT)
+    {
         return ESP_OK; /* Keine Karte – kein Fehler */
     }
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         return err;
     }
     /* Antwort: [0]=NbTg [1]=Tg [2]=ATQA_H [3]=ATQA_L [4]=SAK [5]=NFCIDLen [6..]=NFCID */
     uint8_t resp[24] = {0};
     size_t resp_len = 0;
     err = pn532_read_response(resp, sizeof(resp), &resp_len);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         return err;
     }
-    if ((resp_len < 6u) || (resp[0] == 0u)) {
+    if ((resp_len < 6u) || (resp[0] == 0u))
+    {
         return ESP_OK; /* Kein Target */
     }
     uint8_t nfcid_len = resp[5];
     if ((nfcid_len == 0u) || (nfcid_len > PN532_UID_MAX_LEN) ||
-        ((size_t)(6u + nfcid_len) > resp_len)) {
+        ((size_t)(6u + nfcid_len) > resp_len))
+    {
         return ESP_OK;
     }
     memcpy(uid_out, &resp[6], nfcid_len);
@@ -3783,7 +4984,8 @@ static esp_err_t pn532_list_passive_target(uint8_t *uid_out, uint8_t *uid_len_ou
 /* PN532 I2C-Geraet vom Bus entfernen */
 static esp_err_t pn532_deinit(void)
 {
-    if (s_pn532_dev != NULL) {
+    if (s_pn532_dev != NULL)
+    {
         esp_err_t err = i2c_master_bus_rm_device(s_pn532_dev);
         s_pn532_dev = NULL;
         return err;
@@ -3794,7 +4996,8 @@ static esp_err_t pn532_deinit(void)
 /* PN532 initialisieren: I2C-Bus, Adresse 0x54, Wakeup, SAMConfiguration */
 static esp_err_t pn532_init(void)
 {
-    if (s_pn532_dev != NULL) {
+    if (s_pn532_dev != NULL)
+    {
         return ESP_OK;
     }
 
@@ -3810,7 +5013,8 @@ static esp_err_t pn532_init(void)
     };
 
     esp_err_t err = i2c_master_bus_add_device(i2c_bus, &dev_cfg, &s_pn532_dev);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         return err;
     }
 
@@ -3818,7 +5022,8 @@ static esp_err_t pn532_init(void)
     pn532_wakeup();
 
     err = pn532_sam_config();
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "PN532 SAMConfiguration failed: %s", esp_err_to_name(err));
         i2c_master_bus_rm_device(s_pn532_dev);
         s_pn532_dev = NULL;
@@ -3833,16 +5038,21 @@ static esp_err_t pn532_init(void)
 static esp_err_t pn532_recover(void)
 {
     esp_err_t err = pn532_deinit();
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGW(TAG, "PN532 deinit failed: %s", esp_err_to_name(err));
     }
     /* Physischen I2C-Bus zuruecksetzen: loest haengende SDA/SCL (9 Dummy-Clocks) */
     i2c_master_bus_handle_t i2c_bus = bsp_i2c_get_handle();
-    if (i2c_bus != NULL) {
+    if (i2c_bus != NULL)
+    {
         esp_err_t reset_err = i2c_master_bus_reset(i2c_bus);
-        if (reset_err != ESP_OK) {
+        if (reset_err != ESP_OK)
+        {
             ESP_LOGW(TAG, "I2C bus reset failed: %s", esp_err_to_name(reset_err));
-        } else {
+        }
+        else
+        {
             ESP_LOGI(TAG, "I2C bus reset OK");
         }
     }
@@ -3867,40 +5077,55 @@ static esp_err_t pn532_recover(void)
 static esp_err_t sensors_init(void)
 {
     ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "sensors: I2C init failed");
+
+    /* ADS1115-Zugriffs-Mutex einmalig anlegen */
+    if (s_ads_mutex == NULL)
+    {
+        s_ads_mutex = xSemaphoreCreateMutex();
+    }
+
     i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
     ESP_RETURN_ON_FALSE(bus != NULL, ESP_ERR_INVALID_STATE, TAG, "sensors: I2C bus null");
 
     /* ADS1115 */
-    if (s_ads1115_dev == NULL) {
+    if (s_ads1115_dev == NULL)
+    {
         i2c_device_config_t ads_cfg = {
-            .dev_addr_length  = I2C_ADDR_BIT_LEN_7,
-            .device_address   = ADS1115_I2C_ADDR,
-            .scl_speed_hz     = ADS1115_I2C_SCL_SPEED_HZ,
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = ADS1115_I2C_ADDR,
+            .scl_speed_hz = ADS1115_I2C_SCL_SPEED_HZ,
         };
         esp_err_t e = i2c_master_bus_add_device(bus, &ads_cfg, &s_ads1115_dev);
-        if (e == ESP_OK) {
+        if (e == ESP_OK)
+        {
             ESP_LOGI(TAG, "ADS1115 init OK (0x%02X)", ADS1115_I2C_ADDR);
-        } else {
+        }
+        else
+        {
             ESP_LOGW(TAG, "ADS1115 not found at 0x%02X: %s", ADS1115_I2C_ADDR, esp_err_to_name(e));
             s_ads1115_dev = NULL;
         }
     }
 
     /* PCF8574T */
-    if (s_pcf8574_dev == NULL) {
+    if (s_pcf8574_dev == NULL)
+    {
         i2c_device_config_t pcf_cfg = {
-            .dev_addr_length  = I2C_ADDR_BIT_LEN_7,
-            .device_address   = PCF8574_I2C_ADDR,
-            .scl_speed_hz     = PCF8574_I2C_SCL_SPEED_HZ,
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = PCF8574_I2C_ADDR,
+            .scl_speed_hz = PCF8574_I2C_SCL_SPEED_HZ,
         };
         esp_err_t e = i2c_master_bus_add_device(bus, &pcf_cfg, &s_pcf8574_dev);
-        if (e == ESP_OK) {
+        if (e == ESP_OK)
+        {
             ESP_LOGI(TAG, "PCF8574T init OK (0x%02X)", PCF8574_I2C_ADDR);
             /* Ausgaenge initialisieren: alle aus (active LOW = 1), Eingaenge auf 1 */
             uint8_t pcf_init = PCF_OUTPUT_MASK | PCF_INPUT_MASK;
             i2c_master_transmit(s_pcf8574_dev, &pcf_init, 1, pdMS_TO_TICKS(20));
             s_pcf_output = PCF_OUTPUT_MASK;
-        } else {
+        }
+        else
+        {
             ESP_LOGW(TAG, "PCF8574T not found at 0x%02X: %s", PCF8574_I2C_ADDR, esp_err_to_name(e));
             s_pcf8574_dev = NULL;
         }
@@ -3914,7 +5139,12 @@ static esp_err_t sensors_init(void)
  *   OS=1, MUX=1xx, PGA=010(±2.048V), MODE=1, DR=100(128SPS), COMP_QUE=11(disabled)  */
 static int16_t ads1115_read_channel(uint8_t ch)
 {
-    if (s_ads1115_dev == NULL || ch > 3) {
+    if (s_ads1115_dev == NULL || ch > 3)
+    {
+        return 0;
+    }
+    if (s_ads_mutex && xSemaphoreTake(s_ads_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+    {
         return 0;
     }
     static const uint8_t mux_msb[4] = {0xC5, 0xD5, 0xE5, 0xF5};
@@ -3922,7 +5152,12 @@ static int16_t ads1115_read_channel(uint8_t ch)
     /* Konfigurationsregister schreiben → Konversion starten */
     uint8_t cfg[3] = {0x01, mux_msb[ch], 0x83};
     esp_err_t e = i2c_master_transmit(s_ads1115_dev, cfg, sizeof(cfg), pdMS_TO_TICKS(50));
-    if (e != ESP_OK) {
+    if (e != ESP_OK)
+    {
+        if (s_ads_mutex)
+        {
+            xSemaphoreGive(s_ads_mutex);
+        }
         return 0;
     }
 
@@ -3931,14 +5166,24 @@ static int16_t ads1115_read_channel(uint8_t ch)
     /* Auf Konversionsregister zeigen */
     uint8_t reg = 0x00;
     e = i2c_master_transmit(s_ads1115_dev, &reg, 1, pdMS_TO_TICKS(50));
-    if (e != ESP_OK) {
+    if (e != ESP_OK)
+    {
+        if (s_ads_mutex)
+        {
+            xSemaphoreGive(s_ads_mutex);
+        }
         return 0;
     }
 
     /* 16-Bit-Ergebnis lesen */
     uint8_t buf[2] = {0};
     e = i2c_master_receive(s_ads1115_dev, buf, sizeof(buf), pdMS_TO_TICKS(50));
-    if (e != ESP_OK) {
+    if (s_ads_mutex)
+    {
+        xSemaphoreGive(s_ads_mutex);
+    }
+    if (e != ESP_OK)
+    {
         return 0;
     }
     return (int16_t)((uint16_t)(buf[0] << 8) | buf[1]);
@@ -3947,7 +5192,8 @@ static int16_t ads1115_read_channel(uint8_t ch)
 /* PCF8574T: gewuenschten Ausgangszustand schreiben (0=LOW, 1=HIGH/Input-floating) */
 static void pcf8574_write(uint8_t val)
 {
-    if (s_pcf8574_dev == NULL) {
+    if (s_pcf8574_dev == NULL)
+    {
         return;
     }
     i2c_master_transmit(s_pcf8574_dev, &val, 1, pdMS_TO_TICKS(20));
@@ -3957,7 +5203,12 @@ static void pcf8574_write(uint8_t val)
  * active LOW: bit=0 → aktiv (LED/Relais an), bit=1 → inaktiv. */
 static void pcf8574_set_outputs(uint8_t outputs)
 {
-    s_pcf_output = outputs & PCF_OUTPUT_MASK;
+    uint8_t new_val = outputs & PCF_OUTPUT_MASK;
+    if (new_val == s_pcf_output)
+    {
+        return;
+    } /* kein Write = kein Glitch */
+    s_pcf_output = new_val;
     pcf8574_write(s_pcf_output | PCF_INPUT_MASK);
 }
 
@@ -3965,20 +5216,133 @@ static void pcf8574_set_outputs(uint8_t outputs)
  * Dauer: ~4 × 15 ms (ADS) + 2 ms (PCF) ≈ 62 ms → nur im Auth-Worker aufrufen. */
 static void sensors_read(void)
 {
-    if (s_ads1115_dev != NULL) {
-        for (int ch = 0; ch < 4; ch++) {
+    if (s_ads1115_dev != NULL)
+    {
+        for (int ch = 0; ch < 4; ch++)
+        {
             s_ads_raw[ch] = ads1115_read_channel((uint8_t)ch);
         }
     }
-    if (s_pcf8574_dev != NULL) {
+    if (s_pcf8574_dev != NULL)
+    {
         /* Ausgaenge beibehalten, Eingaenge (P4-P7) fuer Lesevorgang auf 1 setzen */
         pcf8574_write(s_pcf_output | PCF_INPUT_MASK);
         vTaskDelay(pdMS_TO_TICKS(2));
         uint8_t val = 0xFF;
         esp_err_t e = i2c_master_receive(s_pcf8574_dev, &val, 1, pdMS_TO_TICKS(20));
-        if (e == ESP_OK) {
-            s_pcf_input = val & PCF_INPUT_MASK;  /* nur Eingangsbits (P4-P7) speichern */
+        if (e == ESP_OK)
+        {
+            s_pcf_input = val & PCF_INPUT_MASK; /* nur Eingangsbits (P4-P7) speichern */
         }
+    }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Kontinuierliche 230V-Strommessung via MCS1806 an ADS1115 AIN0
+ *
+ * Der ADS1115 wird in den Continuous-Conversion-Modus (MODE=0) versetzt, damit
+ * pro Sample nur ein Register-Pointer-Write + Register-Read noetig ist statt
+ * eines vollstaendigen Single-Shot-Zyklus mit 15ms Wartezeit.
+ *
+ * Ablauf:
+ *   1. ADS1115 einmalig in Continuous-Mode konfigurieren (AIN0, PGA=±2.048 V, 860 SPS)
+ *   2. CURRENT_RMS_SAMPLES (128) Samples rasch hintereinander lesen
+ *   3. RMS-Berechnung:  I_rms = sqrt( mean( (V_sample - V_offset)^2 ) ) / Sensitivity
+ *   4. Ergebnis in s_current_rms_a schreiben
+ *   5. 20ms pausieren, dann wiederholen
+ *
+ * Der Task laeuft auf Core 0 mit niedriger Prioritaet, um LVGL und Auth nicht
+ * zu verdraengen.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+/* ADS1115 Continuous-Mode einrichten fuer AIN0 (860 SPS, PGA ±2.048 V) */
+static void ads1115_start_continuous(void)
+{
+    if (s_ads1115_dev == NULL)
+    {
+        return;
+    }
+    /* Config: OS=0(continuous), MUX=100(AIN0-GND), PGA=010(±2.048V),
+     *         MODE=0(continuous), DR=111(860SPS), COMP_QUE=11(disabled) */
+    uint8_t cfg[3] = {0x01, 0x44, 0xE3};
+    if (s_ads_mutex)
+    {
+        xSemaphoreTake(s_ads_mutex, pdMS_TO_TICKS(200));
+    }
+    i2c_master_transmit(s_ads1115_dev, cfg, sizeof(cfg), pdMS_TO_TICKS(50));
+    /* Zeiger auf Konversionsregister stellen */
+    uint8_t reg = 0x00;
+    i2c_master_transmit(s_ads1115_dev, &reg, 1, pdMS_TO_TICKS(50));
+    if (s_ads_mutex)
+    {
+        xSemaphoreGive(s_ads_mutex);
+    }
+}
+
+/* Einzelnes Raw-Sample im Continuous-Mode lesen (kein Warten, kein Pointer-Write) */
+static int16_t ads1115_read_continuous(void)
+{
+    if (s_ads1115_dev == NULL)
+    {
+        return 0;
+    }
+    uint8_t buf[2] = {0};
+    if (s_ads_mutex && xSemaphoreTake(s_ads_mutex, pdMS_TO_TICKS(50)) != pdTRUE)
+    {
+        return 0;
+    }
+    esp_err_t e = i2c_master_receive(s_ads1115_dev, buf, sizeof(buf), pdMS_TO_TICKS(50));
+    if (s_ads_mutex)
+    {
+        xSemaphoreGive(s_ads_mutex);
+    }
+    if (e != ESP_OK)
+    {
+        return 0;
+    }
+    return (int16_t)((uint16_t)(buf[0] << 8) | buf[1]);
+}
+
+/* Kontinuierlicher Strom-RMS-Task (Core 0, Prio 2) */
+static void current_measure_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "current_measure_task started on core %d", (int)xPortGetCoreID());
+
+    /* Auf ADS1115 warten (kann bei Boot noch nicht bereit sein) */
+    while (s_ads1115_dev == NULL)
+    {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    while (1)
+    {
+        /* Continuous-Mode vor jedem Batch neu setzen, da ads1115_read_channel()
+         * (aufgerufen aus sensors_read/Heartbeat) den ADS1115 auf Single-Shot
+         * umschaltet und damit die Continuous-Konversion stoppt. */
+        ads1115_start_continuous();
+        /* Einschwingzeit: bei 860 SPS dauert eine Konversion ~1,2 ms;
+         * 5 ms reichen sicher fuer das erste gueltige Sample. */
+        vTaskDelay(pdMS_TO_TICKS(5));
+
+        double sum_sq = 0.0;
+        for (int i = 0; i < CURRENT_RMS_SAMPLES; i++)
+        {
+            int16_t raw = ads1115_read_continuous();
+            /* 1 LSB = ADS_LSB_uV µV → in mV umrechnen */
+            float v_mv = (float)raw * ADS_LSB_uV / 1000.0f;
+            float zero = (s_current_zero_mv != 0.0f) ? s_current_zero_mv : MCS1806_OFFSET_MV;
+            float delta_mv = v_mv - zero;
+            float i_a = delta_mv / MCS1806_SENSITIVITY_MV_A;
+            sum_sq += (double)(i_a * i_a);
+            /* 860 SPS → ~1,16 ms pro Sample; kurze Pause damit andere Tasks laufen */
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+        float rms = sqrtf((float)(sum_sq / CURRENT_RMS_SAMPLES));
+        s_current_rms_a = rms;
+
+        /* 20 ms Pause vor naechster RMS-Berechnung */
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
@@ -4002,36 +5366,44 @@ static void nfc_task(void *arg)
     ESP_LOGI(TAG, "nfc_task started on core %d", (int)xPortGetCoreID());
 
     esp_err_t err = pn532_init();
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "PN532 init failed: %s", esp_err_to_name(err));
         set_status_text("NFC Fehler", lv_color_hex(0xFCA5A5));
         vTaskDelete(NULL);
         return;
     }
 
-    while (1) {
-        if (!auth_has_token() && s_wifi_has_ip && !s_auth_busy) {
+    while (1)
+    {
+        if (!auth_has_token() && s_wifi_has_ip && !s_auth_busy)
+        {
             int64_t now_us = esp_timer_get_time();
-            if ((s_setup_last_attempt_us == 0) || ((now_us - s_setup_last_attempt_us) >= ((int64_t)SETUP_RETRY_INTERVAL_MS * 1000))) {
+            if ((s_setup_last_attempt_us == 0) || ((now_us - s_setup_last_attempt_us) >= ((int64_t)SETUP_RETRY_INTERVAL_MS * 1000)))
+            {
                 enqueue_setup_request_if_needed();
             }
         }
 
-        if (s_reset_nfc_uid_requested) {
+        if (s_reset_nfc_uid_requested)
+        {
             last_uid_text[0] = '\0';
             s_reset_nfc_uid_requested = false;
         }
 
-        if (s_auth_busy && (s_auth_busy_since_us > 0)) {
+        if (s_auth_busy && (s_auth_busy_since_us > 0))
+        {
             int64_t busy_ms = (esp_timer_get_time() - s_auth_busy_since_us) / 1000;
-            if (busy_ms > AUTH_BUSY_TIMEOUT_MS) {
+            if (busy_ms > AUTH_BUSY_TIMEOUT_MS)
+            {
                 ESP_LOGW(TAG, "Auth busy timeout (%lld ms), force clear", (long long)busy_ms);
                 set_auth_busy(false);
                 set_status_text("Server Timeout, erneut versuchen", lv_color_hex(0xFCA5A5));
             }
         }
 
-        if (((s_current_view != APP_VIEW_START) && !s_register_card_mode) || s_auth_busy || s_pause_nfc_polling) {
+        if (((s_current_view != APP_VIEW_START) && !s_register_card_mode) || s_auth_busy || s_pause_nfc_polling)
+        {
             vTaskDelay(pdMS_TO_TICKS(NFC_POLL_PAUSED_MS));
             continue;
         }
@@ -4041,19 +5413,25 @@ static void nfc_task(void *arg)
         uint8_t uid_len = 0;
         err = pn532_list_passive_target(uid_buf, &uid_len);
 
-        if (err != ESP_OK) {
+        if (err != ESP_OK)
+        {
             scan_fail_streak++;
-            if ((scan_fail_streak <= 3u) || (scan_fail_streak % 10u == 0u)) {
+            if ((scan_fail_streak <= 3u) || (scan_fail_streak % 10u == 0u))
+            {
                 ESP_LOGW(TAG, "PN532 scan error (%lu): %s", (unsigned long)scan_fail_streak, esp_err_to_name(err));
             }
-            if (scan_fail_streak >= PN532_SCAN_FAIL_REINIT_THRESHOLD) {
+            if (scan_fail_streak >= PN532_SCAN_FAIL_REINIT_THRESHOLD)
+            {
                 ESP_LOGW(TAG, "PN532 recovering after %lu errors", (unsigned long)scan_fail_streak);
                 set_status_text("NFC wird neu gestartet...", lv_color_hex(0xFDE68A));
                 esp_err_t recover_err = pn532_recover();
-                if (recover_err != ESP_OK) {
+                if (recover_err != ESP_OK)
+                {
                     ESP_LOGE(TAG, "PN532 recovery failed: %s", esp_err_to_name(recover_err));
                     set_status_text("NFC Fehler", lv_color_hex(0xFCA5A5));
-                } else {
+                }
+                else
+                {
                     scan_fail_streak = 0;
                 }
             }
@@ -4063,9 +5441,11 @@ static void nfc_task(void *arg)
 
         scan_fail_streak = 0;
 
-        if (uid_len == 0u) {
+        if (uid_len == 0u)
+        {
             /* Keine Karte im Feld */
-            if (last_uid_text[0] != '\0') {
+            if (last_uid_text[0] != '\0')
+            {
                 last_uid_text[0] = '\0';
                 set_nfc_uid_text("NFC UID: -", lv_color_hex(0x86EFAC));
             }
@@ -4078,15 +5458,18 @@ static void nfc_task(void *arg)
         /* UID als Hex-String formatieren (mit ':' als Trennzeichen) */
         int written = 0;
         uid_text[0] = '\0';
-        for (uint8_t i = 0; (i < uid_len) && (written >= 0) && (written < (int)sizeof(uid_text)); i++) {
+        for (uint8_t i = 0; (i < uid_len) && (written >= 0) && (written < (int)sizeof(uid_text)); i++)
+        {
             written += snprintf(&uid_text[written], sizeof(uid_text) - (size_t)written, "%02X", uid_buf[i]);
-            if (i + 1 < uid_len) {
+            if (i + 1 < uid_len)
+            {
                 written += snprintf(&uid_text[written], sizeof(uid_text) - (size_t)written, ":");
             }
         }
 
         /* Gleiche Karte noch im Feld – nicht erneut authentifizieren */
-        if (strcmp(uid_text, last_uid_text) == 0) {
+        if (strcmp(uid_text, last_uid_text) == 0)
+        {
             vTaskDelay(pdMS_TO_TICKS(NFC_POLL_IDLE_MS));
             continue;
         }
@@ -4098,7 +5481,8 @@ static void nfc_task(void *arg)
         strncpy(last_uid_text, uid_text, sizeof(last_uid_text) - 1);
         last_uid_text[sizeof(last_uid_text) - 1] = '\0';
 
-        if (!auth_has_token()) {
+        if (!auth_has_token())
+        {
             set_status_text("Warte auf Geraete-Setup", lv_color_hex(0xFDE68A));
             vTaskDelay(pdMS_TO_TICKS(NFC_POLL_AFTER_CARD_MS));
             continue;
@@ -4110,23 +5494,53 @@ static void nfc_task(void *arg)
         /* Doppelpunkte entfernen (Server erwartet reinen Hex-String) */
         {
             size_t j = 0;
-            for (size_t i = 0; (uid_text[i] != '\0') && (j < sizeof(req.value_a) - 1u); i++) {
-                if (uid_text[i] != ':') {
+            for (size_t i = 0; (uid_text[i] != '\0') && (j < sizeof(req.value_a) - 1u); i++)
+            {
+                if (uid_text[i] != ':')
+                {
                     req.value_a[j++] = uid_text[i];
                 }
             }
             req.value_a[j] = '\0';
         }
 
-        if (enqueue_auth_request(&req)) {
+        /* SuperUser-Check: direkte lokale Freischaltung ohne Server-Abfrage */
+        if (!s_register_card_mode && s_bridge_cfg.superuser_count > 0)
+        {
+            bool is_superuser = false;
+            for (int su = 0; su < s_bridge_cfg.superuser_count; su++)
+            {
+                if (s_bridge_cfg.superuser_uids[su][0] != '\0' &&
+                    strcasecmp(req.value_a, s_bridge_cfg.superuser_uids[su]) == 0)
+                {
+                    is_superuser = true;
+                    break;
+                }
+            }
+            if (is_superuser)
+            {
+                ESP_LOGI(TAG, "SuperUser UID erkannt: %s – sofortige Freischaltung", req.value_a);
+                set_status_text("SuperUser - Zugang gewährt", lv_color_hex(0x86EFAC));
+                activate_unlock(s_bridge_cfg.unlock_duration_min > 0 ? s_bridge_cfg.unlock_duration_min : 30);
+                vTaskDelay(pdMS_TO_TICKS(NFC_POLL_AFTER_CARD_MS));
+                continue;
+            }
+        }
+
+        if (enqueue_auth_request(&req))
+        {
             set_auth_busy(true);
-            if (s_register_card_mode) {
+            if (s_register_card_mode)
+            {
                 s_register_card_mode = false;
-                if (s_ui.result_text_label && bsp_display_lock(30)) {
+                if (s_ui.result_text_label && bsp_display_lock(30))
+                {
                     set_label_text_color(s_ui.result_text_label, "Karte wird registriert...", lv_color_hex(0xFDE68A));
                     bsp_display_unlock();
                 }
-            } else {
+            }
+            else
+            {
                 set_status_text("Karte wird geprüft...", lv_color_hex(0xFDE68A));
             }
         }
@@ -4154,15 +5568,21 @@ static void nfc_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "Core config: LVGL=%d AUTH=%d", LVGL_TASK_CORE_ID, AUTH_TASK_CORE_ID);
+
+    /* Zeitzone auf Deutschland setzen (CET/CEST) – unabhängig von SNTP */
+    setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+    tzset();
+
     esp_err_t err = nvs_flash_init();
-    if ((err == ESP_ERR_NVS_NO_FREE_PAGES) || (err == ESP_ERR_NVS_NEW_VERSION_FOUND)) {
+    if ((err == ESP_ERR_NVS_NO_FREE_PAGES) || (err == ESP_ERR_NVS_NEW_VERSION_FOUND))
+    {
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
 
     i2c_scan_log();
-    sensors_init();  /* ADS1115 + PCF8574T initialisieren */
+    sensors_init(); /* ADS1115 + PCF8574T initialisieren */
 
     /* PWRKEY (SYS_OUT) on GPIO 16: goes LOW when BAT_PWR button is pressed */
     {
@@ -4183,11 +5603,29 @@ void app_main(void)
     ESP_ERROR_CHECK(auth_cfg_load(&s_auth_cfg));
     ESP_ERROR_CHECK(bridge_cfg_load(&s_bridge_cfg));
     /* Gespeicherten Messwert nach Neustart wiederherstellen */
-    if (s_bridge_cfg.idle_current > 0.0f) {
+    if (s_bridge_cfg.idle_current > 0.0f)
+    {
         s_idle_current_measured_mV = s_bridge_cfg.idle_current;
     }
-    if (s_auth_cfg.mac[0] == '\0') {
-        if (get_device_mac_text(s_auth_cfg.mac, sizeof(s_auth_cfg.mac)) == ESP_OK) {
+    /* Gespeicherten Nullpunkt laden – zuerst separater Key (versionierungsunabhaengig),
+     * Fallback auf bridge_cfg-Blob fuer Rueckwaertskompatibilitaet */
+    {
+        float z = zero_cal_load();
+        if (z == 0.0f)
+        {
+            z = s_bridge_cfg.current_zero_mv;
+        }
+        if (z != 0.0f)
+        {
+            s_current_zero_mv = z;
+            s_bridge_cfg.current_zero_mv = z;
+            ESP_LOGI(TAG, "Strom-Nullpunkt aus NVS: %.3f mV", (double)s_current_zero_mv);
+        }
+    }
+    if (s_auth_cfg.mac[0] == '\0')
+    {
+        if (get_device_mac_text(s_auth_cfg.mac, sizeof(s_auth_cfg.mac)) == ESP_OK)
+        {
             auth_cfg_save(&s_auth_cfg);
         }
     }
@@ -4199,13 +5637,15 @@ void app_main(void)
     bsp_display_start_with_config(&display_cfg);
 
     s_io_expander = bsp_io_expander_init();
-    if (!s_io_expander) {
+    if (!s_io_expander)
+    {
         ESP_LOGW(TAG, "IO expander init failed, buzzer disabled");
     }
 
     {
         esp_lcd_panel_handle_t panel = bsp_get_panel_handle();
-        if (panel) {
+        if (panel)
+        {
             const esp_lcd_rgb_panel_event_callbacks_t panel_cbs = {
                 .on_vsync = vsync_event_cb,
             };
@@ -4216,6 +5656,23 @@ void app_main(void)
     bsp_display_lock(0);
     create_ui();
     update_machine_info_ui();
+
+    /* Touch-Scroll-Schwelle erhoehen: Finger muss mindestens 20 px bewegen
+     * bevor LVGL einen Scroll erkennt (Standard: 10 px). Verhindert versehentliche
+     * Auswahl beim Scrollen in der WLAN-Dropdown-Liste. */
+    {
+        lv_indev_t *indev = lv_indev_get_next(NULL);
+        while (indev != NULL)
+        {
+            if (lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER)
+            {
+                lv_indev_set_scroll_limit(indev, 20);
+                break;
+            }
+            indev = lv_indev_get_next(indev);
+        }
+    }
+
     bsp_display_unlock();
 
     s_auth_req_queue = xQueueCreate(AUTH_REQ_QUEUE_LEN, sizeof(auth_request_t));
@@ -4224,19 +5681,29 @@ void app_main(void)
     ESP_ERROR_CHECK(s_auth_res_queue != NULL ? ESP_OK : ESP_FAIL);
 
     BaseType_t auth_task_ok = xTaskCreatePinnedToCore(auth_worker_task, "auth_worker", 8192, NULL, 5, NULL, AUTH_TASK_CORE_ID);
-    if (auth_task_ok != pdPASS) {
+    if (auth_task_ok != pdPASS)
+    {
         ESP_LOGE(TAG, "Auth worker start failed");
     }
 
+    /* Kontinuierliche Strommessung (MCS1806 an ADS1115 AIN0) */
+    BaseType_t cur_task_ok = xTaskCreatePinnedToCore(current_measure_task, "cur_meas", 4096, NULL, 2, NULL, NFC_TASK_CORE_ID);
+    if (cur_task_ok != pdPASS)
+    {
+        ESP_LOGE(TAG, "current_measure_task creation failed");
+    }
+
     err = wifi_init_sta();
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "WiFi init failed: %s", esp_err_to_name(err));
         set_status_text("WLAN Init Fehler", lv_color_hex(0xFCA5A5));
     }
 
 #if ENABLE_NFC
     BaseType_t nfc_task_ok = xTaskCreatePinnedToCore(nfc_task, "nfc_task", 6144, NULL, 1, NULL, NFC_TASK_CORE_ID);
-    if (nfc_task_ok != pdPASS) {
+    if (nfc_task_ok != pdPASS)
+    {
         ESP_LOGE(TAG, "NFC task start failed");
     }
 #endif

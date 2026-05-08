@@ -43,6 +43,50 @@ from datetime import datetime, timedelta, timezone
 from werkzeug.exceptions import BadRequest
 from werkzeug.utils import secure_filename
 
+# Zeitzone: Alle internen datetime-Vergleiche in Berliner Lokalzeit (CET/CEST).
+# Die gespeicherten start_dt/end_dt kommen als naive Strings aus dem Browser
+# (datetime-local Input), der die Lokalzeit des Nutzers verwendet.
+try:
+    from zoneinfo import ZoneInfo
+    _TZ_BERLIN = ZoneInfo("Europe/Berlin")
+except ImportError:
+    try:
+        from pytz import timezone as _pytz_tz
+        _TZ_BERLIN = _pytz_tz("Europe/Berlin")
+    except ImportError:
+        _TZ_BERLIN = None  # Fallback: manueller DST-Algorithmus
+
+
+def _berlin_offset_hours(utc_dt):
+    """Berechnet den UTC-Offset für Berlin manuell (CET=+1, CEST=+2).
+    Sommerzeitbeginn: letzter Sonntag im März 01:00 UTC
+    Sommerzeitende:   letzter Sonntag im Oktober 01:00 UTC"""
+    year = utc_dt.year
+    dst_start = max(
+        datetime(year, 3, d, 1, 0, tzinfo=timezone.utc)
+        for d in range(25, 32) if datetime(year, 3, d).weekday() == 6
+    )
+    dst_end = max(
+        datetime(year, 10, d, 1, 0, tzinfo=timezone.utc)
+        for d in range(25, 32) if datetime(year, 10, d).weekday() == 6
+    )
+    return 2 if dst_start <= utc_dt < dst_end else 1
+
+
+def _now_berlin():
+    """Gibt die aktuelle Zeit in der Berliner Zeitzone als naive datetime zurück
+    (kein tzinfo), damit sie direkt mit den gespeicherten naive Strings verglichen
+    werden kann. Verwendet immer UTC als Basis – niemals Systemlocaltime."""
+    utc_now = datetime.now(timezone.utc)
+    if _TZ_BERLIN is not None:
+        try:
+            result = utc_now.astimezone(_TZ_BERLIN).replace(tzinfo=None)
+            return result
+        except Exception:
+            pass  # Fallthrough zum manuellen Algorithmus
+    offset_h = _berlin_offset_hours(utc_now)
+    return (utc_now + timedelta(hours=offset_h)).replace(tzinfo=None)
+
 try:
     import pyotp
 except ImportError:
@@ -206,6 +250,24 @@ def init_clients_db():
                               'ALTER TABLE bridge_config ADD COLUMN ads3 INTEGER NOT NULL DEFAULT 0')
         add_column_if_missing(conn, 'bridge_config', 'pcf_input',
                               'ALTER TABLE bridge_config ADD COLUMN pcf_input INTEGER NOT NULL DEFAULT 255')
+        add_column_if_missing(conn, 'bridge_config', 'current_rms_a',
+                              'ALTER TABLE bridge_config ADD COLUMN current_rms_a REAL NOT NULL DEFAULT 0.0')
+        add_column_if_missing(conn, 'bridge_config', 'idle_shutdown_delay_s',
+                              'ALTER TABLE bridge_config ADD COLUMN idle_shutdown_delay_s INTEGER NOT NULL DEFAULT 60')
+
+        conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS reservations (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                mac_address TEXT NOT NULL,
+                res_name    TEXT NOT NULL DEFAULT '',
+                start_dt    TEXT NOT NULL,
+                end_dt      TEXT NOT NULL,
+                note        TEXT NOT NULL DEFAULT '',
+                created_at  TEXT NOT NULL
+            )
+            '''
+        )
 
         conn.commit()
 
@@ -261,6 +323,8 @@ def init_users_db():
         )
         add_column_if_missing(conn, 'users', 'unlock_duration',
                               'ALTER TABLE users ADD COLUMN unlock_duration INTEGER')
+        add_column_if_missing(conn, 'users', 'is_superuser',
+                              'ALTER TABLE users ADD COLUMN is_superuser INTEGER NOT NULL DEFAULT 0')
         conn.execute(
             '''
             CREATE TABLE IF NOT EXISTS mail_otp_log (
@@ -461,8 +525,19 @@ def ensure_bridge_config(mac_address):
     return get_bridge_config(mac_address)
 
 
-def bridge_config_to_dict(cfg):
+def bridge_config_to_dict(cfg, mac_address=None):
     # Wandelt Bridge-Konfigurations-Row in dict für JSON um
+    # Liest SuperUser-UIDs aller aktiven Superuser aus der users-DB
+    def _get_superuser_uids():
+        try:
+            with users_db_connect() as uconn:
+                rows = uconn.execute(
+                    'SELECT nfc_uid FROM users WHERE is_superuser = 1 AND is_active = 1 AND nfc_uid IS NOT NULL'
+                ).fetchall()
+            return [row['nfc_uid'] for row in rows if row['nfc_uid']]
+        except Exception:
+            return []
+
     if cfg is None:
         return {
             'machine_name': '',
@@ -473,10 +548,12 @@ def bridge_config_to_dict(cfg):
             'otp_required': True,
             'info_url': '',
             'unlock_duration': 30,
+            'idle_shutdown_delay_s': 60,
             'config_version': 0,
             'auto_ota': False,
             'ads0': 0, 'ads1': 0, 'ads2': 0, 'ads3': 0,
             'pcf_input': 255,
+            'superuser_uids': _get_superuser_uids(),
         }
     return {
         'machine_name': cfg['machine_name'],
@@ -487,6 +564,7 @@ def bridge_config_to_dict(cfg):
         'otp_required': bool(cfg['otp_required']),
         'info_url': cfg['info_url'],
         'unlock_duration': max(1, min(1440, int(cfg['unlock_duration'] or 30))),
+        'idle_shutdown_delay_s': max(10, min(3600, int(cfg['idle_shutdown_delay_s'] or 60))),
         'config_version': cfg['config_version'],
         'auto_ota': bool(cfg['auto_ota']),
         'ads0': int(cfg['ads0'] or 0),
@@ -494,6 +572,7 @@ def bridge_config_to_dict(cfg):
         'ads2': int(cfg['ads2'] or 0),
         'ads3': int(cfg['ads3'] or 0),
         'pcf_input': int(cfg['pcf_input'] if cfg['pcf_input'] is not None else 255),
+        'superuser_uids': _get_superuser_uids(),
     }
 
 
@@ -501,6 +580,40 @@ def list_bridge_configs():
     # Gibt alle Bridge-Konfigurationen als Liste zurück
     with clients_db_connect() as conn:
         return conn.execute('SELECT * FROM bridge_config ORDER BY mac_address ASC').fetchall()
+
+
+def get_next_reservation(mac_address):
+    """Gibt die nächste Reservierung zurück, die innerhalb der nächsten 24h startet
+    oder gerade läuft (end_dt in der Zukunft). Gibt None zurück wenn keine vorhanden.
+
+    Vergleich erfolgt als datetime-Objekte (nicht als Strings), damit Formatunterschiede
+    (z.B. gespeicherte Sekunden) und Zeitzonenprobleme keine Rolle spielen."""
+    now = _now_berlin()
+    lookahead = now + timedelta(hours=24)
+    app.logger.debug('[get_next_reservation] mac=%s now_berlin=%s', mac_address,
+                     now.strftime('%Y-%m-%dT%H:%M'))
+    with clients_db_connect() as conn:
+        rows = conn.execute(
+            'SELECT * FROM reservations WHERE mac_address = ? ORDER BY start_dt ASC',
+            (mac_address,)
+        ).fetchall()
+    for row in rows:
+        try:
+            end = datetime.strptime(row['end_dt'][:16], '%Y-%m-%dT%H:%M')
+            start = datetime.strptime(row['start_dt'][:16], '%Y-%m-%dT%H:%M')
+        except (ValueError, TypeError):
+            app.logger.warning('[get_next_reservation] Ungültiges Datumsformat: start=%s end=%s',
+                               row['start_dt'], row['end_dt'])
+            continue
+        if end > now and start <= lookahead:
+            app.logger.info('[get_next_reservation] Reservierung gefunden: "%s" %s -> %s (now=%s)',
+                            row['res_name'], row['start_dt'], row['end_dt'],
+                            now.strftime('%Y-%m-%dT%H:%M'))
+            return row
+        if end <= now:
+            app.logger.debug('[get_next_reservation] Abgelaufene Reservierung übersprungen: "%s" end=%s now=%s',
+                             row['res_name'], row['end_dt'], now.strftime('%Y-%m-%dT%H:%M'))
+    return None
 
 
 def get_client_from_token_value(token_value, endpoint_name):
@@ -694,7 +807,7 @@ _pending_totp = {}
 def is_pin_valid(client, pin):
     # Prüft, ob PIN für Client noch gültig ist
     expires_at = parse_iso_datetime(client['pin_expires'])
-    now = datetime.now()
+    now = _now_berlin()
     if client['current_pin'] is None or expires_at is None or now > expires_at:
         return False
     return client['current_pin'] == pin
@@ -1026,37 +1139,49 @@ def handle_heartbeat():
         while len(ads) < 4:
             ads.append(0)
         pcf_input = int(data.get('pcf', 255)) & 0xFF
-        idle_current_mV_raw = data.get('idle_current_mV')
-        idle_current_mV = float(idle_current_mV_raw) if idle_current_mV_raw is not None else None
+        idle_current_a_raw = data.get('idle_current_a')
+        idle_current_a = float(idle_current_a_raw) if idle_current_a_raw is not None else None
+        current_rms_a_raw = data.get('current_rms_a')
+        current_rms_a = float(current_rms_a_raw) if current_rms_a_raw is not None else None
         now = localtime_iso()
         with clients_db_connect() as conn:
-            if fw_version and idle_current_mV is not None:
+            if fw_version and idle_current_a is not None:
                 conn.execute(
                     'UPDATE bridge_config SET last_heartbeat_at=?, unlock_status=?, unlock_remaining_min=?,'
-                    ' fw_version=?, ads0=?, ads1=?, ads2=?, ads3=?, pcf_input=?, idle_current=? WHERE mac_address=?',
+                    ' fw_version=?, ads0=?, ads1=?, ads2=?, ads3=?, pcf_input=?, idle_current=?, current_rms_a=? WHERE mac_address=?',
                     (now, unlock_status, unlock_remaining_min, fw_version,
-                     ads[0], ads[1], ads[2], ads[3], pcf_input, idle_current_mV, client['mac_address']))
+                     ads[0], ads[1], ads[2], ads[3], pcf_input,
+                     idle_current_a, current_rms_a if current_rms_a is not None else 0.0,
+                     client['mac_address']))
             elif fw_version:
                 conn.execute(
                     'UPDATE bridge_config SET last_heartbeat_at=?, unlock_status=?, unlock_remaining_min=?,'
-                    ' fw_version=?, ads0=?, ads1=?, ads2=?, ads3=?, pcf_input=? WHERE mac_address=?',
+                    ' fw_version=?, ads0=?, ads1=?, ads2=?, ads3=?, pcf_input=?, current_rms_a=? WHERE mac_address=?',
                     (now, unlock_status, unlock_remaining_min, fw_version,
-                     ads[0], ads[1], ads[2], ads[3], pcf_input, client['mac_address']))
-            elif idle_current_mV is not None:
+                     ads[0], ads[1], ads[2], ads[3], pcf_input,
+                     current_rms_a if current_rms_a is not None else 0.0,
+                     client['mac_address']))
+            elif idle_current_a is not None:
                 conn.execute(
                     'UPDATE bridge_config SET last_heartbeat_at=?, unlock_status=?, unlock_remaining_min=?,'
-                    ' ads0=?, ads1=?, ads2=?, ads3=?, pcf_input=?, idle_current=? WHERE mac_address=?',
+                    ' ads0=?, ads1=?, ads2=?, ads3=?, pcf_input=?, idle_current=?, current_rms_a=? WHERE mac_address=?',
                     (now, unlock_status, unlock_remaining_min,
-                     ads[0], ads[1], ads[2], ads[3], pcf_input, idle_current_mV, client['mac_address']))
+                     ads[0], ads[1], ads[2], ads[3], pcf_input,
+                     idle_current_a, current_rms_a if current_rms_a is not None else 0.0,
+                     client['mac_address']))
             else:
                 conn.execute(
                     'UPDATE bridge_config SET last_heartbeat_at=?, unlock_status=?, unlock_remaining_min=?,'
-                    ' ads0=?, ads1=?, ads2=?, ads3=?, pcf_input=? WHERE mac_address=?',
+                    ' ads0=?, ads1=?, ads2=?, ads3=?, pcf_input=?, current_rms_a=? WHERE mac_address=?',
                     (now, unlock_status, unlock_remaining_min,
-                     ads[0], ads[1], ads[2], ads[3], pcf_input, client['mac_address']))
+                     ads[0], ads[1], ads[2], ads[3], pcf_input,
+                     current_rms_a if current_rms_a is not None else 0.0,
+                     client['mac_address']))
             conn.commit()
-        if idle_current_mV is not None:
-            app.logger.info('[HEARTBEAT] idle_current_mV=%.3f saved for mac=%s', idle_current_mV, client['mac_address'])
+        if idle_current_a is not None:
+            app.logger.info('[HEARTBEAT] idle_current_a=%.3f A saved for mac=%s', idle_current_a, client['mac_address'])
+        if current_rms_a is not None:
+            app.logger.info('[HEARTBEAT] current_rms_a=%.3f A for mac=%s', current_rms_a, client['mac_address'])
 
         resp = {
             'valid': True,
@@ -1067,6 +1192,13 @@ def handle_heartbeat():
 
         if config_changed and cfg:
             resp['config'] = bridge_config_to_dict(cfg)
+
+        # Nächste Reservierung (innerhalb 24h oder aktiv) in Antwort einbetten
+        reservation = get_next_reservation(client['mac_address'])
+        if reservation:
+            resp['res_name'] = reservation['res_name']
+            resp['res_start'] = reservation['start_dt']
+            resp['res_end'] = reservation['end_dt']
 
         return jsonify(resp)
     except Exception:
@@ -1304,6 +1436,7 @@ def admin_save_user():
     nfc_uid = normalize_uid(data.get('nfc_uid')) if data.get('nfc_uid') else None
     otp_secret = (data.get('otp_secret') or '').strip().upper() or None
     is_active = 1 if bool(data.get('is_active', True)) else 0
+    is_superuser = 1 if bool(data.get('is_superuser', False)) else 0
     unlock_dur_raw = data.get('unlock_duration')
     unlock_duration = max(1, min(1440, int(unlock_dur_raw))) if unlock_dur_raw not in (None, '', 0) else None
 
@@ -1339,10 +1472,10 @@ def admin_save_user():
             conn.execute(
                 '''
                 UPDATE users
-                SET email = ?, display_name = ?, password_hash = ?, nfc_uid = ?, otp_secret = ?, otp_secret_hash = ?, is_active = ?, unlock_duration = ?, updated_at = ?
+                SET email = ?, display_name = ?, password_hash = ?, nfc_uid = ?, otp_secret = ?, otp_secret_hash = ?, is_active = ?, is_superuser = ?, unlock_duration = ?, updated_at = ?
                 WHERE id = ?
                 ''',
-                (email, display_name, password_hash, nfc_uid, final_otp_secret, final_otp_hash, is_active, unlock_duration, localtime_iso(), user_id),
+                (email, display_name, password_hash, nfc_uid, final_otp_secret, final_otp_hash, is_active, is_superuser, unlock_duration, localtime_iso(), user_id),
             )
         else:
             if not password:
@@ -1357,10 +1490,10 @@ def admin_save_user():
             now = localtime_iso()
             conn.execute(
                 '''
-                INSERT INTO users (email, display_name, password_hash, nfc_uid, otp_secret, otp_secret_hash, is_active, unlock_duration, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO users (email, display_name, password_hash, nfc_uid, otp_secret, otp_secret_hash, is_active, is_superuser, unlock_duration, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''',
-                (email, display_name, hash_password(password), nfc_uid, otp_secret, otp_hash, is_active, unlock_duration, now, now),
+                (email, display_name, hash_password(password), nfc_uid, otp_secret, otp_hash, is_active, is_superuser, unlock_duration, now, now),
             )
         conn.commit()
 
@@ -1494,6 +1627,7 @@ def admin_save_bridge_config():
     otp_required = 1 if data.get('otp_required', True) else 0
     info_url = (data.get('info_url') or '').strip()[:127]
     unlock_duration = max(1, min(1440, int(data.get('unlock_duration', 30))))
+    idle_shutdown_delay_s = max(10, min(3600, int(data.get('idle_shutdown_delay_s', 60))))
     auto_ota = 1 if data.get('auto_ota') else 0
 
     now = localtime_iso()
@@ -1503,16 +1637,16 @@ def admin_save_bridge_config():
             new_version = existing['config_version'] + 1
             conn.execute(
                 '''UPDATE bridge_config SET machine_name=?, location=?, idle_current=?,
-                   sound_enabled=?, idle_detection_enabled=?, otp_required=?, info_url=?, unlock_duration=?, auto_ota=?, config_version=?, updated_at=?
+                   sound_enabled=?, idle_detection_enabled=?, otp_required=?, info_url=?, unlock_duration=?, idle_shutdown_delay_s=?, auto_ota=?, config_version=?, updated_at=?
                    WHERE mac_address=?''',
-                (machine_name, location, idle_current, sound_enabled, idle_detection_enabled, otp_required, info_url, unlock_duration, auto_ota, new_version, now, mac),
+                (machine_name, location, idle_current, sound_enabled, idle_detection_enabled, otp_required, info_url, unlock_duration, idle_shutdown_delay_s, auto_ota, new_version, now, mac),
             )
         else:
             conn.execute(
                 '''INSERT INTO bridge_config (mac_address, machine_name, location, idle_current,
-                   sound_enabled, idle_detection_enabled, otp_required, info_url, unlock_duration, auto_ota, config_version, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)''',
-                (mac, machine_name, location, idle_current, sound_enabled, idle_detection_enabled, otp_required, info_url, unlock_duration, auto_ota, now),
+                   sound_enabled, idle_detection_enabled, otp_required, info_url, unlock_duration, idle_shutdown_delay_s, auto_ota, config_version, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)''',
+                (mac, machine_name, location, idle_current, sound_enabled, idle_detection_enabled, otp_required, info_url, unlock_duration, idle_shutdown_delay_s, auto_ota, now),
             )
         conn.commit()
 
@@ -1802,6 +1936,69 @@ def admin_ota_info():
 
 
 
+# ============================================================================
+# Reservierungen: Admin-Endpunkte
+# ============================================================================
+
+@app.route('/api/admin/reservations', methods=['GET'])
+@admin_required
+def admin_get_reservations():
+    mac = request.args.get('mac', '').strip()
+    with clients_db_connect() as conn:
+        if mac:
+            rows = conn.execute(
+                'SELECT * FROM reservations WHERE mac_address=? ORDER BY start_dt ASC', (mac,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                'SELECT * FROM reservations ORDER BY start_dt ASC'
+            ).fetchall()
+    return jsonify({'valid': True, 'reservations': [dict(r) for r in rows]})
+
+
+@app.route('/api/admin/reservations/save', methods=['POST'])
+@admin_required
+def admin_save_reservation():
+    data = request.get_json(force=True) or {}
+    mac = (data.get('mac_address') or '').strip()[:17]
+    name = (data.get('res_name') or '').strip()[:64]
+    start_dt = (data.get('start_dt') or '').strip()[:16]
+    end_dt = (data.get('end_dt') or '').strip()[:16]
+    note = (data.get('note') or '').strip()[:255]
+    res_id = data.get('id')
+    if not mac or not name or not start_dt or not end_dt:
+        return jsonify({'valid': False, 'error': 'missing_fields'}), 400
+    if start_dt >= end_dt:
+        return jsonify({'valid': False, 'error': 'end_before_start'}), 400
+    now = localtime_iso()
+    with clients_db_connect() as conn:
+        if res_id:
+            conn.execute(
+                'UPDATE reservations SET mac_address=?, res_name=?, start_dt=?, end_dt=?, note=? WHERE id=?',
+                (mac, name, start_dt, end_dt, note, int(res_id))
+            )
+        else:
+            conn.execute(
+                'INSERT INTO reservations (mac_address, res_name, start_dt, end_dt, note, created_at) VALUES (?,?,?,?,?,?)',
+                (mac, name, start_dt, end_dt, note, now)
+            )
+        conn.commit()
+    return jsonify({'valid': True})
+
+
+@app.route('/api/admin/reservations/delete', methods=['POST'])
+@admin_required
+def admin_delete_reservation():
+    data = request.get_json(force=True) or {}
+    res_id = data.get('id')
+    if not res_id:
+        return jsonify({'valid': False, 'error': 'missing_id'}), 400
+    with clients_db_connect() as conn:
+        conn.execute('DELETE FROM reservations WHERE id=?', (int(res_id),))
+        conn.commit()
+    return jsonify({'valid': True})
+
+
 # Zeigt Clients, User, Bridge-Config, Unlock-Log, Mail-OTP-Log.
 # ============================================================================
 
@@ -1845,6 +2042,7 @@ def dashboard():
             <button onclick="showSection('mail')">Mail OTP Simulation</button>
             <button onclick="showSection('unlocklog')">Freischaltungen</button>
             <button onclick="showSection('ota')">Firmware OTA</button>
+            <button onclick="showSection('reservations')">Reservierungen</button>
             <button onclick="loadAll()">Reload</button>
         </div>
 
@@ -1858,6 +2056,7 @@ def dashboard():
                 <input id="u_uid" placeholder="nfc uid (hex)" maxlength="14" />
                 <input id="u_unlock_dur" placeholder="Freischaltzeit (Min, leer=Bridge-Standard)" style="width:250px" type="number" step="1" min="1" max="1440" />
                 <label><input type="checkbox" id="u_active" checked /> aktiv</label>
+                <label><input type="checkbox" id="u_superuser" /> <span style="color:#fbbf24;font-weight:bold;">&#9733; SuperUser</span> (NFC ohne Server/OTP)</label>
                 <button onclick="saveUser()">Speichern</button>
                 <button onclick="clearUserForm()">Form leeren</button>
             </div>
@@ -1904,6 +2103,7 @@ def dashboard():
                 <label><input type="checkbox" id="bc_auto_ota" /> Auto-Update (OTA)</label>
                 <input id="bc_info_url" placeholder="Info URL" style="width:300px" maxlength="127" />
                 <input id="bc_unlock_dur" placeholder="Freischaltzeit (Min)" style="width:150px" type="number" step="1" min="1" max="1440" value="30" />
+                <input id="bc_idle_shutdown" placeholder="Idle-Abschaltverzögerung (s)" style="width:180px" type="number" step="1" min="10" max="3600" value="60" />
                 <button onclick="saveBridgeCfg()">Speichern</button>
                 <button onclick="clearBridgeCfgForm()">Abbrechen</button>
             </div>
@@ -1941,6 +2141,34 @@ def dashboard():
             <div id="otaMsg" style="margin-top:8px;"></div>
         </div>
 
+        <div id="reservations" class="section card">
+            <h2>Reservierungen</h2>
+            <div style="margin-bottom:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <label>Bridge (MAC):
+                    <select id="resv_mac_filter" onchange="loadReservations()" style="padding:5px; min-width:200px;">
+                        <option value="">Alle Bridges</option>
+                    </select>
+                </label>
+                <button onclick="clearReservForm()">+ Neue Reservierung</button>
+            </div>
+            <div id="reservForm" style="display:none; padding:12px; background:#f9fafb; border:1px solid #e5e7eb; border-radius:8px; margin-bottom:12px;">
+                <strong id="reservFormTitle">Neue Reservierung</strong><br/><br/>
+                <input type="hidden" id="resv_id" />
+                <label>Bridge (MAC):
+                    <select id="resv_mac" style="padding:5px; min-width:200px;">
+                    </select>
+                </label>&nbsp;
+                <input id="resv_name" placeholder="Name (Reservierende Person)" maxlength="64" style="width:220px;" />
+                <input type="datetime-local" id="resv_start" style="padding:5px;" />
+                <input type="datetime-local" id="resv_end" style="padding:5px;" />
+                <input id="resv_note" placeholder="Notiz (optional)" maxlength="255" style="width:220px;" />
+                <button onclick="saveReservation()">Speichern</button>
+                <button onclick="document.getElementById(\'reservForm\').style.display=\'none\'">Abbrechen</button>
+            </div>
+            <div id="reservMsg"></div>
+            <div id="reservTable"></div>
+        </div>
+
         <script>
             function showSection(name) {
                 for (const el of document.querySelectorAll('.section')) {
@@ -1973,6 +2201,7 @@ def dashboard():
                 document.getElementById('u_uid').value = '';
                 document.getElementById('u_unlock_dur').value = '';
                 document.getElementById('u_active').checked = true;
+                document.getElementById('u_superuser').checked = false;
             }
 
             function fillUserForm(u) {
@@ -1984,6 +2213,7 @@ def dashboard():
                 document.getElementById('u_otp').value = '';
                 document.getElementById('u_unlock_dur').value = u.unlock_duration != null ? u.unlock_duration : '';
                 document.getElementById('u_active').checked = !!u.is_active;
+                document.getElementById('u_superuser').checked = !!u.is_superuser;
             }
 
             async function loadUsers() {
@@ -1997,13 +2227,14 @@ def dashboard():
                         <td>${u.unlock_duration != null ? u.unlock_duration + ' min' : '<span style="color:#9ca3af;">Bridge</span>'}</td>
                         <td>${u.has_otp ? '<span style="color:#166534;">&#10003; aktiv</span> <button onclick="removeTotp(' + u.id + ')">Entfernen</button>' : '<button onclick="setupTotp(' + u.id + ',\\'' + esc(u.display_name) + '\\')">Einrichten</button>'}</td>
                         <td>${u.is_active ? 'ja' : 'nein'}</td>
+                        <td>${u.is_superuser ? '<span style="color:#fbbf24;font-weight:bold;">&#9733; ja</span>' : '-'}</td>
                         <td>
                             <button onclick='fillUserForm(${JSON.stringify(u)})'>Bearbeiten</button>
                             <button onclick='deleteUser(${u.id})'>Loeschen</button>
                         </td>
                     </tr>
                 `).join('');
-                document.getElementById('usersTable').innerHTML = `<table><tr><th>ID</th><th>Email</th><th>Name</th><th>NFC UID</th><th>Freischaltzeit</th><th>OTP</th><th>Aktiv</th><th>Aktion</th></tr>${rows}</table>`;
+                document.getElementById('usersTable').innerHTML = `<table><tr><th>ID</th><th>Email</th><th>Name</th><th>NFC UID</th><th>Freischaltzeit</th><th>OTP</th><th>Aktiv</th><th>SuperUser</th><th>Aktion</th></tr>${rows}</table>`;
             }
 
             async function saveUser() {
@@ -2017,6 +2248,7 @@ def dashboard():
                         nfc_uid: document.getElementById('u_uid').value,
                         unlock_duration: document.getElementById('u_unlock_dur').value ? parseInt(document.getElementById('u_unlock_dur').value) : null,
                         is_active: document.getElementById('u_active').checked,
+                        is_superuser: document.getElementById('u_superuser').checked,
                     });
                     msg.className = 'ok';
                     msg.textContent = 'User gespeichert';
@@ -2230,6 +2462,122 @@ def dashboard():
                 await loadMail();
                 await loadUnlockLog();
                 await loadOtaInfo();
+                await loadReservations();
+                await _populateReservBridgeSelects();
+            }
+
+            // ── Reservierungen ──────────────────────────────────────────────
+
+            async function _populateReservBridgeSelects() {
+                let data;
+                try { data = await api('/api/admin/bridge_config'); } catch(e) { return; }
+                const cfgs = data.configs || [];
+                const filter = document.getElementById('resv_mac_filter');
+                const sel = document.getElementById('resv_mac');
+                [filter, sel].forEach(el => {
+                    if (!el) return;
+                    const saved = el.value;
+                    while (el.options.length > (el === filter ? 1 : 0)) el.remove(el === filter ? 1 : 0);
+                    cfgs.forEach(c => {
+                        const label = (c.machine_name || c.mac_address) + ' (' + c.mac_address + ')';
+                        const opt = new Option(label, c.mac_address);
+                        el.add(opt);
+                    });
+                    if (saved) el.value = saved;
+                });
+            }
+
+            async function loadReservations() {
+                const mac = (document.getElementById('resv_mac_filter') || {}).value || '';
+                const url = '/api/admin/reservations' + (mac ? '?mac=' + encodeURIComponent(mac) : '');
+                let data;
+                try { data = await api(url); } catch(e) { return; }
+                const rows = (data.reservations || []).map(r => {
+                    const now = new Date();
+                    const start = new Date(r.start_dt.replace('T', ' '));
+                    const end   = new Date(r.end_dt.replace('T', ' '));
+                    let badge = '';
+                    if (now >= start && now < end) {
+                        badge = '<span style="color:#16a34a;font-weight:700;"> &#9679; Aktiv</span>';
+                    } else if (end < now) {
+                        badge = '<span style="color:#9ca3af;"> abgelaufen</span>';
+                    } else {
+                        const diffH = ((start - now) / 3600000).toFixed(1);
+                        badge = '<span style="color:#6366f1;">in ' + diffH + ' h</span>';
+                    }
+                    return `<tr>
+                        <td>${esc(r.id)}</td>
+                        <td>${esc(r.mac_address)}</td>
+                        <td>${esc(r.res_name)}</td>
+                        <td>${esc(r.start_dt)}</td>
+                        <td>${esc(r.end_dt)}</td>
+                        <td>${esc(r.note)}</td>
+                        <td>${badge}</td>
+                        <td>
+                            <button onclick='fillReservForm(${JSON.stringify(r)})'>Bearbeiten</button>
+                            <button onclick='deleteReservation(${r.id})'>Loeschen</button>
+                        </td>
+                    </tr>`;
+                }).join('');
+                document.getElementById('reservTable').innerHTML = rows
+                    ? `<table><tr><th>ID</th><th>Bridge MAC</th><th>Name</th><th>Start</th><th>Ende</th><th>Notiz</th><th>Status</th><th>Aktion</th></tr>${rows}</table>`
+                    : '<em style="color:#9ca3af;">Keine Reservierungen vorhanden.</em>';
+            }
+
+            function clearReservForm() {
+                document.getElementById('resv_id').value = '';
+                document.getElementById('resv_name').value = '';
+                document.getElementById('resv_start').value = '';
+                document.getElementById('resv_end').value = '';
+                document.getElementById('resv_note').value = '';
+                document.getElementById('reservFormTitle').textContent = 'Neue Reservierung';
+                document.getElementById('reservForm').style.display = 'block';
+            }
+
+            function fillReservForm(r) {
+                document.getElementById('resv_id').value = r.id || '';
+                document.getElementById('resv_mac').value = r.mac_address || '';
+                document.getElementById('resv_name').value = r.res_name || '';
+                document.getElementById('resv_start').value = r.start_dt || '';
+                document.getElementById('resv_end').value = r.end_dt || '';
+                document.getElementById('resv_note').value = r.note || '';
+                document.getElementById('reservFormTitle').textContent = 'Reservierung bearbeiten';
+                document.getElementById('reservForm').style.display = 'block';
+            }
+
+            async function saveReservation() {
+                const msg = document.getElementById('reservMsg');
+                try {
+                    await api('/api/admin/reservations/save', 'POST', {
+                        id: document.getElementById('resv_id').value || null,
+                        mac_address: document.getElementById('resv_mac').value,
+                        res_name: document.getElementById('resv_name').value,
+                        start_dt: document.getElementById('resv_start').value,
+                        end_dt: document.getElementById('resv_end').value,
+                        note: document.getElementById('resv_note').value,
+                    });
+                    msg.className = 'ok';
+                    msg.textContent = 'Reservierung gespeichert.';
+                    document.getElementById('reservForm').style.display = 'none';
+                    await loadReservations();
+                } catch(e) {
+                    msg.className = 'err';
+                    msg.textContent = 'Fehler: ' + e;
+                }
+            }
+
+            async function deleteReservation(id) {
+                if (!confirm('Reservierung wirklich loeschen?')) return;
+                const msg = document.getElementById('reservMsg');
+                try {
+                    await api('/api/admin/reservations/delete', 'POST', { id: id });
+                    msg.className = 'ok';
+                    msg.textContent = 'Reservierung geloescht.';
+                    await loadReservations();
+                } catch(e) {
+                    msg.className = 'err';
+                    msg.textContent = 'Fehler: ' + e;
+                }
             }
 
             function clearBridgeCfgForm() {
@@ -2257,6 +2605,7 @@ def dashboard():
                 document.getElementById('bc_otp').checked = cfg.otp_required !== false && cfg.otp_required !== 0;
                 document.getElementById('bc_info_url').value = cfg.info_url || '';
                 document.getElementById('bc_unlock_dur').value = cfg.unlock_duration != null ? cfg.unlock_duration : 30;
+                document.getElementById('bc_idle_shutdown').value = cfg.idle_shutdown_delay_s != null ? cfg.idle_shutdown_delay_s : 60;
                 document.getElementById('bc_auto_ota').checked = !!cfg.auto_ota;
                 document.getElementById('bridgecfgForm').style.display = 'block';
             }
@@ -2322,11 +2671,13 @@ def dashboard():
                         <td>${esc(cfg.mac_address)}</td>
                         <td>${esc(cfg.machine_name)}</td>
                         <td>${esc(cfg.location)}</td>
-                        <td>${esc(cfg.idle_current)}</td>
+                        <td>${esc(cfg.idle_current != null ? cfg.idle_current.toFixed(3) + ' A' : '-')}</td>
+                        <td style="font-family:monospace;">${cfg.current_rms_a != null ? cfg.current_rms_a.toFixed(3) + ' A' : '-'}</td>
                         <td>${cfg.sound_enabled ? 'ja' : 'nein'}</td>
                         <td>${cfg.idle_detection_enabled ? 'ja' : 'nein'}</td>
                         <td>${cfg.otp_required ? 'ja' : 'nein'}</td>
                         <td>${esc(cfg.unlock_duration)} min</td>
+                        <td>${esc(cfg.idle_shutdown_delay_s != null ? cfg.idle_shutdown_delay_s : 60)} s</td>
                         <td>${ulBadge}</td>
                         <td>${esc(cfg.config_version)}</td>
                         <td>${esc(cfg.fw_version || '-')}</td>
@@ -2341,7 +2692,7 @@ def dashboard():
                         </td>
                     </tr>`;
                 }).join('');
-                document.getElementById('bridgecfgTable').innerHTML = `<table><tr><th>MAC</th><th>Maschinenname</th><th>Standort</th><th>Idle Strom</th><th>Sound</th><th>Idle-Erkennung</th><th>OTP</th><th>Freischaltzeit</th><th>Freigabe</th><th>Version</th><th>Firmware</th><th>Auto-Update</th><th>ADS1115 (AIN0-3)</th><th>PCF8574 P7..P0</th><th>Heartbeat</th><th>Updated</th><th>Aktion</th></tr>${rows}</table>`;
+                document.getElementById('bridgecfgTable').innerHTML = `<table><tr><th>MAC</th><th>Maschinenname</th><th>Standort</th><th>Idle Strom</th><th>Strom RMS</th><th>Sound</th><th>Idle-Erkennung</th><th>OTP</th><th>Freischaltzeit</th><th>Idle-Abschaltverzögerung</th><th>Freigabe</th><th>Version</th><th>Firmware</th><th>Auto-Update</th><th>ADS1115 (AIN0-3)</th><th>PCF8574 P7..P0</th><th>Heartbeat</th><th>Updated</th><th>Aktion</th></tr>${rows}</table>`;
             }
 
             async function deleteBridgeCfg(mac) {
@@ -2371,6 +2722,7 @@ def dashboard():
                         otp_required: document.getElementById('bc_otp').checked,
                         info_url: document.getElementById('bc_info_url').value,
                         unlock_duration: parseInt(document.getElementById('bc_unlock_dur').value) || 30,
+                        idle_shutdown_delay_s: parseInt(document.getElementById('bc_idle_shutdown').value) || 60,
                         auto_ota: document.getElementById('bc_auto_ota').checked,
                     });
                     msg.className = 'ok';
