@@ -57,6 +57,7 @@
 #include "esp_ota_ops.h"
 #include <math.h>
 #include "freertos/semphr.h"
+#include "mbedtls/sha256.h"
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Build-Konfiguration: ENABLE_NFC steuert, ob echter NFC-Betrieb (PN532)
@@ -91,20 +92,28 @@ LV_IMG_DECLARE(hsd_logo);
 #define PWRKEY_GPIO GPIO_NUM_16
 
 #define BRIDGE_CFG_NAMESPACE "bridge_cfg"
-#define BRIDGE_CFG_VERSION 6
+#define BRIDGE_CFG_VERSION 8           /* v8: resource_id (Anny-Ressourcen-ID) ergaenzt; v7: config_version als SHA-256-Hash-String */
 #define ZERO_CAL_NVS_KEY "zero_cal_mv" /* Separater NVS-Key – versionierungsunabhaengig */
-#define SUPERUSER_MAX 32               /* Maximale Anzahl SuperUser-UIDs pro Bridge */
+#define SUPERUSER_MAX 64               /* Maximale Anzahl SuperUser-UIDs pro Bridge */
 #define SUPERUSER_UID_LEN 16           /* Max. Hex-Zeichen einer NFC-UID ohne Trennzeichen */
+#define BRIDGE_CFG_HASH_HEX_LEN 64     /* SHA-256-Hex-Digest-Laenge (ohne Nullterminator) */
 #define HEARTBEAT_INTERVAL_MS (5 * 60 * 1000)
 #define HEARTBEAT_INTERVAL_UNCONFIGURED_MS (1 * 60 * 1000)
 
 /* Server-Endpunkte – alle Authentifizierungs-URLs zeigen auf den LiMa Server */
-#define AUTH_URL_SETUP "https://lima.hsd.pub/api/hsd/setup"
-#define AUTH_URL_NFC "https://lima.hsd.pub/api/hsd/nfc"
-#define AUTH_URL_LOGIN "https://lima.hsd.pub/api/hsd/login"
-#define AUTH_URL_PIN "https://lima.hsd.pub/api/hsd/pin"
-#define AUTH_URL_HEARTBEAT "https://lima.hsd.pub/api/hsd/heartbeat"
-#define AUTH_URL_REGISTER_CARD "https://lima.hsd.pub/api/hsd/register_card"
+// #define AUTH_URL_ACTIVATIONS "https://10.50.55.55:8080/activations"
+// #define AUTH_URL_ACTIVATION_DECISION "https://10.50.55.55:8080/activations/decision/"
+// #define AUTH_URL_HEARTBEAT "https://10.50.55.55:8080/heartbeat"
+// #define AUTH_URL_BOOKINGS "https://10.50.55.55:8080/bookings/"
+// #define AUTH_URL_CONFIGURATION "https://10.50.55.55:8080/heartbeat/configuration"
+#define AUTH_URL_ACTIVATIONS "https://lima.intern.hs-duesseldorf.de/activations"
+#define AUTH_URL_ACTIVATION_DECISION "https://lima.intern.hs-duesseldorf.de/activations/decision/"
+#define AUTH_URL_HEARTBEAT "https://lima.intern.hs-duesseldorf.de/heartbeat"
+#define AUTH_URL_BOOKINGS "https://lima.intern.hs-duesseldorf.de/bookings/"
+#define AUTH_URL_CONFIGURATION "https://lima.intern.hs-duesseldorf.de/heartbeat/configuration"
+#ifndef BRIDGE_API_TOKEN
+#define BRIDGE_API_TOKEN "TK8LskbrmJOo310IJ6cjdcUJa9TBU8N8y76x8LM2A4ew4cwdGw2acCeXU7wP9Mwr"
+#endif
 #define OTA_URL_CHECK "https://lima.hsd.pub/api/hsd/ota/check"
 #define OTA_URL_FIRMWARE "https://lima.hsd.pub/api/hsd/ota/firmware"
 #define DEV_TLS_INSECURE 0 /* Let's Encrypt: echte Zertifikatspruefung aktiv */
@@ -133,8 +142,12 @@ LV_IMG_DECLARE(hsd_logo);
 /* Externe Sensorik: ADS1115 (16-Bit-ADC, 4 Kanaele) + PCF8574T (8-Bit-I/O-Expander) */
 #define ADS1115_I2C_ADDR 0x48 /* ADDR-Pin auf GND */
 #define PCF8574_I2C_ADDR 0x20 /* A0-A2 auf GND    */
-#define ADS1115_I2C_SCL_SPEED_HZ 400000
-#define PCF8574_I2C_SCL_SPEED_HZ 400000
+/* 100kHz statt 400kHz, wie PN532: gleiche Taktrate fuer alle Geraete auf dem geteilten
+ * Bus vermeidet, dass der i2c_master-Treiber bei jedem Geraete-Wechsel zwischen zwei
+ * Tasks (current_measure_task vs. nfc_task) die SCL-Frequenz umschalten muss – das war
+ * die Ursache der PN532 ESP_ERR_INVALID_STATE-Fehler im Betrieb. */
+#define ADS1115_I2C_SCL_SPEED_HZ 100000
+#define PCF8574_I2C_SCL_SPEED_HZ 100000
 
 /* PCF8574T Pin-Belegung: P0-P3 Ausgaenge (active LOW), P4-P7 Eingaenge */
 #define PCF_PIN_LED_RED 0u    /* P0: Rote LED    (active LOW: 0=an, 1=aus) */
@@ -225,13 +238,14 @@ typedef struct
     char machine_name[64];
     char location[64];
     char info_url[128];
+    char resource_id[24]; /* Anny-Ressourcen-ID (nur Ziffern); Pflicht fuer POST /activations und GET /bookings/{id} */
     float idle_current;
     uint8_t sound_enabled;
     uint8_t idle_detection_enabled;
     uint8_t otp_required;
     uint8_t auto_ota; /* 1 = automatisch updaten wenn neue Version verfuegbar */
     uint32_t unlock_duration_min;
-    uint32_t config_version;
+    char config_version[BRIDGE_CFG_HASH_HEX_LEN + 1];          /* SHA-256-Hash (hex) statt hochzaehlender Versionsnummer */
     float current_zero_mv;                                     /* Kalibrierter Nullpunkt des Stromsensors [mV]; 0.0 = unkalibriert → MCS1806_OFFSET_MV */
     uint32_t idle_shutdown_delay_s;                            /* Wartezeit [s] nach Timer-Ablauf, bis Relay bei Idle abschaltet; 0 = Default 60s */
     char superuser_uids[SUPERUSER_MAX][SUPERUSER_UID_LEN + 1]; /* SuperUser-UIDs (reine Hex-Strings, keine ':') */
@@ -246,6 +260,10 @@ typedef struct
     lv_obj_t *qr_code;
     lv_obj_t *status_label;
     lv_obj_t *nfc_uid_label;
+    lv_obj_t *activation_overlay;
+    lv_obj_t *activation_qr;
+    lv_obj_t *activation_url_label;
+    lv_obj_t *activation_hint_label;
     lv_obj_t *start_container;
     lv_obj_t *pin_container;
     lv_obj_t *result_container;
@@ -374,8 +392,16 @@ static char s_next_res_name[65] = "";
 static char s_next_res_start[17] = "";
 static char s_next_res_end[17] = "";
 static volatile bool s_has_next_reservation = false;
-static SemaphoreHandle_t s_ads_mutex = NULL; /* Mutex fuer ADS1115-Zugriff */
-static int64_t s_ui_btn_last_us = 0;         /* Debounce: Zeitstempel letzter UI-Klick */
+static char s_activation_url[256] = "";
+static char s_activation_code[32] = "";
+static int64_t s_activation_expires_at_us = 0;
+static lv_timer_t *s_activation_poll_timer = NULL;
+static char s_device_id[64] = ""; /* Wird in app_main() aus der MAC-Adresse abgeleitet */
+/* Nicht mehr static: wird auch aus esp_lvgl_port_touch.c (GT911-Poll-Task, Core 0)
+ * per extern-Deklaration mitbenutzt, um den geteilten I2C-Bus zwischen Touch-Polling
+ * und PN532/ADS1115/PCF8574 zu serialisieren. Siehe Kommentar dort fuer Details. */
+SemaphoreHandle_t s_ads_mutex = NULL; /* Mutex fuer den geteilten I2C-Bus */
+static int64_t s_ui_btn_last_us = 0;  /* Debounce: Zeitstempel letzter UI-Klick */
 
 static void set_label_text_color(lv_obj_t *label, const char *text, lv_color_t color);
 static void set_status_text(const char *text, lv_color_t color);
@@ -547,11 +573,61 @@ static esp_err_t auth_cfg_load(auth_store_t *cfg)
     return ESP_OK;
 }
 
+/* Deterministischer SHA-256-Hash über die admin-konfigurierbaren Felder von bridge_cfg_t.
+ * Ersetzt die frühere hochzählende Versionsnummer als config_version. fw_version fließt
+ * bewusst NICHT ein, sonst würde jedes OTA-Update einen Config-Sync auslösen, obwohl sich
+ * an der eigentlichen Konfiguration nichts geändert hat. */
+static void bridge_cfg_compute_hash(const bridge_cfg_t *cfg, char out_hex[BRIDGE_CFG_HASH_HEX_LEN + 1])
+{
+    char buf[768];
+    int len = snprintf(buf, sizeof(buf),
+                       "%s|%s|%s|%s|%.3f|%u|%u|%u|%u|%u|%u",
+                       cfg->machine_name, cfg->location, cfg->info_url, cfg->resource_id,
+                       (double)cfg->idle_current,
+                       (unsigned)cfg->sound_enabled, (unsigned)cfg->idle_detection_enabled,
+                       (unsigned)cfg->otp_required, (unsigned)cfg->auto_ota,
+                       (unsigned)cfg->unlock_duration_min, (unsigned)cfg->idle_shutdown_delay_s);
+    if ((len < 0) || (len > (int)sizeof(buf) - 1))
+    {
+        len = (int)sizeof(buf) - 1;
+    }
+
+    for (uint8_t i = 0; (i < cfg->superuser_count) && (len < (int)sizeof(buf) - 1); i++)
+    {
+        int add = snprintf(buf + len, sizeof(buf) - (size_t)len, "|%s", cfg->superuser_uids[i]);
+        if (add > 0)
+        {
+            len += add;
+        }
+        if (len > (int)sizeof(buf) - 1)
+        {
+            len = (int)sizeof(buf) - 1;
+        }
+    }
+
+    unsigned char digest[32];
+    mbedtls_sha256((const unsigned char *)buf, (size_t)len, digest, 0 /* SHA-256, nicht SHA-224 */);
+
+    for (int i = 0; i < 32; i++)
+    {
+        snprintf(out_hex + (i * 2), 3, "%02x", digest[i]);
+    }
+    out_hex[BRIDGE_CFG_HASH_HEX_LEN] = '\0';
+}
+
+/* true, wenn der Server (oder zuvor die Bridge selbst) bereits echte Konfigurationsdaten
+ * hinterlegt hat – analog zur is_configured-Heuristik in server.py (machine_name/location). */
+static bool bridge_cfg_is_configured(const bridge_cfg_t *cfg)
+{
+    return (cfg->machine_name[0] != '\0') || (cfg->location[0] != '\0');
+}
+
 /* Bridge-Konfiguration auf Standardwerte zurücksetzen */
 static void bridge_cfg_set_defaults(bridge_cfg_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
     cfg->version = BRIDGE_CFG_VERSION;
+    bridge_cfg_compute_hash(cfg, cfg->config_version); /* config_version darf niemals leer sein */
 }
 
 /* Bridge-Konfiguration im NVS speichern */
@@ -628,10 +704,15 @@ static float zero_cal_load(void)
     return val;
 }
 
-/* Prüft ob ein gültiger Server-Token vorhanden ist */
+static const char *auth_active_token(void)
+{
+    return BRIDGE_API_TOKEN;
+}
+
+/* Es gibt nur einen gültigen Server-Token: den festen Bridge-Bearer-Token. */
 static bool auth_has_token(void)
 {
-    return s_auth_cfg.token[0] != '\0';
+    return BRIDGE_API_TOKEN[0] != '\0';
 }
 
 /* MAC-Adresse als formatierte Zeichenkette (XX:XX:XX:XX:XX:XX) in Buffer schreiben */
@@ -1047,6 +1128,10 @@ static esp_err_t wifi_init_sta(void)
     ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG, "wifi storage failed");
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "wifi mode set failed");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start failed");
+    /* Kein Modem-Sleep: Die Bridge ist netzbetrieben, und der Default (WIFI_PS_MIN_MODEM) verzoegert
+     * Pakete bis zum naechsten DTIM-Beacon. Das macht den mehrteiligen TLS-Handshake (~5 KB
+     * Zertifikatskette) langsam und fuehrt zu Connect-Timeouts. */
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_NONE));
 
     if (s_wifi_cfg.ssid[0] == '\0')
     {
@@ -1108,7 +1193,7 @@ static bool enqueue_token_check_request_if_needed(void)
     }
 
     set_auth_busy(true);
-    set_status_text("Token wird geprüft...", lv_color_hex(0x93C5FD));
+    // set_status_text("Token wird geprüft...", lv_color_hex(0x93C5FD));
     return true;
 }
 
@@ -1313,45 +1398,134 @@ static bool enqueue_auth_request(const auth_request_t *req)
     return xQueueSend(s_auth_req_queue, req, 0) == pdTRUE;
 }
 
-/* Prüft ob Server-Antwort ein positives Ergebnis ("valid":true usw.) enthält */
-static bool response_is_true(const char *resp)
+static void clear_activation_state(void)
 {
-    const char *pos = NULL;
+    s_activation_url[0] = '\0';
+    s_activation_code[0] = '\0';
+    s_activation_expires_at_us = 0;
+    if (s_activation_poll_timer != NULL)
+    {
+        lv_timer_del(s_activation_poll_timer);
+        s_activation_poll_timer = NULL;
+    }
+    if (s_ui.activation_overlay)
+    {
+        lv_obj_add_flag(s_ui.activation_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_ui.qr_code)
+    {
+        if (s_bridge_cfg.info_url[0])
+        {
+            lv_qrcode_update(s_ui.qr_code, s_bridge_cfg.info_url, strlen(s_bridge_cfg.info_url));
+            lv_obj_clear_flag(s_ui.qr_code, LV_OBJ_FLAG_HIDDEN);
+        }
+        else
+        {
+            lv_obj_add_flag(s_ui.qr_code, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (s_ui.status_label)
+    {
+        lv_label_set_text(s_ui.status_label, "Bitte HSD Karte anlegen");
+        lv_obj_set_style_text_color(s_ui.status_label, lv_color_hex(0x93C5FD), 0);
+    }
+}
 
-    if ((resp == NULL) || (resp[0] == '\0'))
+static void show_activation_url_on_display(void)
+{
+    ESP_LOGI(TAG, "[UI] show_activation_url_on_display: url=%s expires_us=%lld now_us=%lld",
+             s_activation_url[0] ? s_activation_url : "<empty>",
+             (long long)s_activation_expires_at_us,
+             (long long)time(NULL) * 1000000LL);
+
+    if (s_ui.activation_overlay == NULL)
+    {
+        ESP_LOGW(TAG, "[UI] activation overlay not created yet");
+        return;
+    }
+
+    if ((s_activation_url[0] == '\0') || (s_activation_expires_at_us > 0 && ((int64_t)time(NULL) * 1000000LL) >= s_activation_expires_at_us))
+    {
+        ESP_LOGW(TAG, "[UI] activation URL invalid or expired; hiding overlay");
+        clear_activation_state();
+        set_status_text("Bitte HSD Karte anlegen", lv_color_hex(0x93C5FD));
+        return;
+    }
+
+    if (s_current_view != APP_VIEW_START)
+    {
+        show_view(APP_VIEW_START);
+    }
+
+    /* Nur beim Wechsel von versteckt -> sichtbar beepen, nicht bei jedem Poll-Tick
+     * (diese Funktion wird alle 1,5s vom Aktivierungs-Timer erneut aufgerufen). */
+    const bool activation_overlay_was_hidden = lv_obj_has_flag(s_ui.activation_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_ui.activation_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_ui.activation_overlay);
+    if (activation_overlay_was_hidden)
+    {
+        beep(1);
+    }
+    ESP_LOGI(TAG, "[UI] activation overlay shown and moved to foreground");
+
+    if (s_ui.activation_url_label)
+    {
+        lv_label_set_text(s_ui.activation_url_label, s_activation_url);
+    }
+
+    if (s_ui.activation_hint_label)
+    {
+        lv_label_set_text(s_ui.activation_hint_label, "Bitte im Browser anmelden");
+    }
+
+    if (s_ui.activation_qr)
+    {
+        lv_qrcode_update(s_ui.activation_qr, s_activation_url, strlen(s_activation_url));
+        lv_obj_clear_flag(s_ui.activation_qr, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (s_ui.status_label && bsp_display_lock(30))
+    {
+        lv_label_set_text(s_ui.status_label, s_activation_url);
+        lv_obj_set_style_text_font(s_ui.status_label, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(s_ui.status_label, lv_color_hex(0xFDE68A), 0);
+        lv_label_set_long_mode(s_ui.status_label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(s_ui.status_label, lv_pct(100));
+        bsp_display_unlock();
+    }
+}
+
+static bool extract_code_from_url(const char *url, char *out, size_t out_size)
+{
+    const char *slash = NULL;
+    const char *code_start = NULL;
+    size_t len = 0;
+
+    if ((url == NULL) || (out == NULL) || (out_size == 0))
     {
         return false;
     }
 
-    if (strstr(resp, "\"result\":true") || strstr(resp, "\"allowed\":true") || strstr(resp, "\"success\":true") || strstr(resp, "\"valid\":true"))
+    slash = strrchr(url, '/');
+    if (slash == NULL)
     {
-        return true;
+        return false;
     }
 
-    if ((strcmp(resp, "true") == 0) || (strcmp(resp, "{\"result\":true}") == 0) || (strcmp(resp, "{\"valid\":true}") == 0))
+    code_start = slash + 1;
+    if (code_start[0] == '\0')
     {
-        return true;
+        return false;
     }
 
-    pos = strstr(resp, "\"valid\"");
-    if (pos != NULL)
+    len = strlen(code_start);
+    if (len >= out_size)
     {
-        pos = strchr(pos, ':');
-        if (pos != NULL)
-        {
-            pos++;
-            while ((*pos != '\0') && isspace((unsigned char)*pos))
-            {
-                pos++;
-            }
-            if (strncmp(pos, "true", 4) == 0)
-            {
-                return true;
-            }
-        }
+        len = out_size - 1;
     }
-
-    return false;
+    memcpy(out, code_start, len);
+    out[len] = '\0';
+    return true;
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -1653,6 +1827,44 @@ static int extract_json_int(const char *resp, const char *key, int fallback)
     return (int)val;
 }
 
+static int64_t extract_json_int64(const char *resp, const char *key, int64_t fallback)
+{
+    char needle[40] = {0};
+    const char *pos = NULL;
+
+    if ((resp == NULL) || (key == NULL))
+    {
+        return fallback;
+    }
+
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    pos = strstr(resp, needle);
+    if (pos == NULL)
+    {
+        return fallback;
+    }
+
+    pos = strchr(pos + strlen(needle), ':');
+    if (pos == NULL)
+    {
+        return fallback;
+    }
+
+    pos++;
+    while ((*pos != '\0') && isspace((unsigned char)*pos))
+    {
+        pos++;
+    }
+
+    char *end = NULL;
+    long long val = strtoll(pos, &end, 10);
+    if (end == pos)
+    {
+        return fallback;
+    }
+    return (int64_t)val;
+}
+
 /* Bridge-Konfiguration (Maschinenname, Standort etc.) aus Server-JSON parsen */
 /* Reservierungsbanner aktualisieren – muss aus LVGL-Task oder mit bsp_display_lock() aufgerufen werden */
 static void update_reservation_display_locked(void)
@@ -1726,9 +1938,10 @@ static void parse_bridge_config_from_response(const char *resp)
         return;
     }
 
-    /* Look for "config" object in response */
-    const char *cfg_start = strstr(resp, "\"config\"");
-    if (cfg_start == NULL)
+    /* LiMa_Server2 liefert eine admin-gepushte Aenderung unter dem Feld "configuration",
+     * unabhaengig vom config_version-Hash (siehe send_heartbeat_with_manifest()-Kommentar) –
+     * "\"config_version\"" matcht hier nicht, da der Substring nicht identisch ist. */
+    if (strstr(resp, "\"configuration\"") == NULL)
     {
         return;
     }
@@ -1736,12 +1949,12 @@ static void parse_bridge_config_from_response(const char *resp)
     extract_json_string(resp, "machine_name", s_bridge_cfg.machine_name, sizeof(s_bridge_cfg.machine_name));
     extract_json_string(resp, "location", s_bridge_cfg.location, sizeof(s_bridge_cfg.location));
     extract_json_string(resp, "info_url", s_bridge_cfg.info_url, sizeof(s_bridge_cfg.info_url));
+    extract_json_string(resp, "resource_id", s_bridge_cfg.resource_id, sizeof(s_bridge_cfg.resource_id));
     s_bridge_cfg.idle_current = extract_json_float(resp, "idle_current", 0.0f);
     s_bridge_cfg.sound_enabled = extract_json_bool(resp, "sound_enabled") ? 1 : 0;
     s_bridge_cfg.idle_detection_enabled = extract_json_bool(resp, "idle_detection_enabled") ? 1 : 0;
     s_bridge_cfg.otp_required = extract_json_bool(resp, "otp_required") ? 1 : 0;
     s_bridge_cfg.unlock_duration_min = (uint32_t)extract_json_int(resp, "unlock_duration", 30);
-    s_bridge_cfg.config_version = (uint32_t)extract_json_int(resp, "config_version", 0);
     s_bridge_cfg.auto_ota = extract_json_bool(resp, "auto_ota") ? 1 : 0;
     s_bridge_cfg.idle_shutdown_delay_s = (uint32_t)extract_json_int(resp, "idle_shutdown_delay_s", 60);
 
@@ -1763,17 +1976,112 @@ static void parse_bridge_config_from_response(const char *resp)
         s_idle_current_measured_mV = s_bridge_cfg.idle_current;
     }
 
+    /* LiMa_Server2 berechnet/sendet nie einen Hash zurueck – config_version ist
+     * ausschliesslich Bridge-seitig ermittelt, also nach jeder Aenderung neu berechnen. */
+    bridge_cfg_compute_hash(&s_bridge_cfg, s_bridge_cfg.config_version);
+
     s_bridge_cfg_updated = true;
-    ESP_LOGI(TAG, "Bridge config parsed: name=%s loc=%s url=%s idle=%.2f sound=%d idle_det=%d ver=%lu",
+    ESP_LOGI(TAG, "Bridge config parsed: name=%s loc=%s url=%s idle=%.2f sound=%d idle_det=%d ver=%s",
              s_bridge_cfg.machine_name, s_bridge_cfg.location, s_bridge_cfg.info_url,
              s_bridge_cfg.idle_current, s_bridge_cfg.sound_enabled,
-             s_bridge_cfg.idle_detection_enabled, (unsigned long)s_bridge_cfg.config_version);
+             s_bridge_cfg.idle_detection_enabled, s_bridge_cfg.config_version);
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
  * HTTPS-Client: Sendet JSON-POST-Requests an den LiMa Server.
  * Fängt Response-Body und X-Bridge-Token-Header ab. Unterstützt Retry.
  * ════════════════════════════════════════════════════════════════════════════ */
+
+static bool http_url_uses_ssl(const char *url)
+{
+    return (url != NULL) && (strncasecmp(url, "https://", 8) == 0);
+}
+
+/* HTTPS GET mit JSON-Antwort; liest Response und optionalen Bearer-Token-Header */
+static bool https_get_json(const char *url, int *http_status, bool *ok, char *response_out, size_t response_out_size)
+{
+    char response[1024] = {0};
+    http_capture_t capture = {
+        .response = response,
+        .response_size = sizeof(response),
+        .response_len = 0,
+        .token = NULL,
+        .token_size = 0,
+    };
+    esp_err_t err = ESP_OK;
+    const bool use_ssl = http_url_uses_ssl(url);
+
+    if (http_status)
+    {
+        *http_status = 0;
+    }
+    if (ok)
+    {
+        *ok = false;
+    }
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .transport_type = use_ssl ? HTTP_TRANSPORT_OVER_SSL : HTTP_TRANSPORT_OVER_TCP,
+        .timeout_ms = 8000,
+        .event_handler = http_capture_event_handler,
+        .user_data = &capture,
+    };
+    if (use_ssl)
+    {
+        cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    }
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (client == NULL)
+    {
+        ESP_LOGW(TAG, "HTTP GET client init failed");
+        return false;
+    }
+
+    const char *token = auth_active_token();
+    if (token[0] != '\0')
+    {
+        char auth_value[192];
+        snprintf(auth_value, sizeof(auth_value), "Bearer %s", token);
+        err = esp_http_client_set_header(client, "Authorization", auth_value);
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "set GET Authorization failed: %s", esp_err_to_name(err));
+            esp_http_client_cleanup(client);
+            return false;
+        }
+    }
+
+    err = esp_http_client_perform(client);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "HTTP GET failed: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    if (http_status)
+    {
+        *http_status = esp_http_client_get_status_code(client);
+    }
+    if (ok && http_status)
+    {
+        /* Der echte Server (LiMa_Server2) signalisiert Erfolg/Fehler ausschliesslich ueber
+         * den HTTP-Status; der Response-Body kann bei Erfolg voellig leer ("{}") sein
+         * (z.B. normaler Heartbeat). Aufrufer werten die konkreten Felder selbst aus. */
+        *ok = (*http_status >= 200) && (*http_status < 300);
+    }
+    if ((response_out != NULL) && (response_out_size > 0))
+    {
+        strncpy(response_out, response, response_out_size - 1);
+        response_out[response_out_size - 1] = '\0';
+    }
+
+    esp_http_client_cleanup(client);
+    return true;
+}
 
 /* HTTPS POST mit JSON-Payload an LiMa Server; liest Response + Token-Header */
 static esp_err_t https_post_json(const char *url, const char *payload, int *http_status, bool *ok, char *response_out, size_t response_out_size, char *token_out, size_t token_out_size)
@@ -1796,21 +2104,39 @@ static esp_err_t https_post_json(const char *url, const char *payload, int *http
         *ok = false;
     }
 
+    const bool use_ssl = http_url_uses_ssl(url);
     esp_http_client_config_t cfg = {
         .url = url,
         .method = HTTP_METHOD_POST,
-        .transport_type = HTTP_TRANSPORT_OVER_SSL,
+        .transport_type = use_ssl ? HTTP_TRANSPORT_OVER_SSL : HTTP_TRANSPORT_OVER_TCP,
         .timeout_ms = 8000,
-        .crt_bundle_attach = esp_crt_bundle_attach, /* Let's Encrypt via ESP-IDF Mozilla-Bundle */
         .event_handler = http_capture_event_handler,
         .user_data = &capture,
     };
+    if (use_ssl)
+    {
+        cfg.crt_bundle_attach = esp_crt_bundle_attach; /* Let's Encrypt via ESP-IDF Mozilla-Bundle */
+    }
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (client == NULL)
     {
         ESP_LOGW(TAG, "HTTP client init failed (soft fail)");
         return ESP_OK;
+    }
+
+    const char *token = auth_active_token();
+    if (token[0] != '\0')
+    {
+        char auth_value[192];
+        snprintf(auth_value, sizeof(auth_value), "Bearer %s", token);
+        err = esp_http_client_set_header(client, "Authorization", auth_value);
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "set Authorization failed (soft fail): %s", esp_err_to_name(err));
+            esp_http_client_cleanup(client);
+            return ESP_OK;
+        }
     }
 
     err = esp_http_client_set_header(client, "Content-Type", "application/json");
@@ -1845,7 +2171,10 @@ static esp_err_t https_post_json(const char *url, const char *payload, int *http
 
     if (ok && http_status)
     {
-        *ok = ((*http_status >= 200) && (*http_status < 300) && response_is_true(response));
+        /* Der echte Server (LiMa_Server2) signalisiert Erfolg/Fehler ausschliesslich ueber
+         * den HTTP-Status; der Response-Body kann bei Erfolg voellig leer ("{}") sein
+         * (z.B. normaler Heartbeat). Aufrufer werten die konkreten Felder selbst aus. */
+        *ok = (*http_status >= 200) && (*http_status < 300);
     }
     if ((response_out != NULL) && (response_out_size > 0))
     {
@@ -1878,6 +2207,275 @@ static void ads1115_start_continuous(void);
 static int16_t ads1115_read_continuous(void);
 static void current_measure_task(void *arg);
 
+/* JSON-String-Escaping: Anfuehrungszeichen/Backslash escapen, Steuerzeichen verwerfen.
+ * Wird fuer admin-konfigurierbare Freitextfelder (machine_name/location/info_url) beim
+ * Aufbau des Manifest-JSON benoetigt, damit z.B. ein Maschinenname mit Anfuehrungszeichen
+ * kein kaputtes JSON erzeugt. */
+static void json_escape_string(const char *in, char *out, size_t out_size)
+{
+    size_t pos = 0;
+    if (out_size == 0)
+    {
+        return;
+    }
+    for (; (in != NULL) && (*in != '\0') && (pos + 2 < out_size); in++)
+    {
+        char c = *in;
+        if ((c == '"') || (c == '\\'))
+        {
+            out[pos++] = '\\';
+            out[pos++] = c;
+        }
+        else if ((unsigned char)c >= 0x20)
+        {
+            out[pos++] = c;
+        }
+        /* Steuerzeichen < 0x20 werden verworfen */
+    }
+    out[pos] = '\0';
+}
+
+/* superuser_uids als JSON-Array serialisieren, z.B. ["04A1B2C3","..."] */
+static void bridge_cfg_superuser_uids_to_json(const bridge_cfg_t *cfg, char *out, size_t out_size)
+{
+    size_t pos;
+    int n;
+
+    if (out_size == 0)
+    {
+        return;
+    }
+    n = snprintf(out, out_size, "[");
+    pos = (n > 0) ? (size_t)n : 0;
+    for (uint8_t i = 0; (i < cfg->superuser_count) && (pos + 1 < out_size); i++)
+    {
+        n = snprintf(out + pos, out_size - pos, "%s\"%s\"", (i > 0) ? "," : "", cfg->superuser_uids[i]);
+        if (n > 0)
+        {
+            pos += (size_t)n;
+            if (pos >= out_size)
+            {
+                pos = out_size - 1;
+            }
+        }
+    }
+    if (pos + 1 < out_size)
+    {
+        out[pos++] = ']';
+        out[pos] = '\0';
+    }
+}
+
+/* JSON-Schema-Manifest fuer LiMa_Server2: Grundlage fuer das dynamische Formular und die
+ * Telemetrie-Tabelle im Web-Dashboard (LiMa_Server2/web/src/app/routes/device.ts,
+ * manifestSection()/configField()). Feldnamen unter properties.configuration.properties
+ * muessen exakt zu bridge_cfg_to_configuration_json() passen, die unter
+ * properties.telemetry.properties exakt zum "telemetry"-Objekt in send_heartbeat_with_manifest()
+ * und im normalen Heartbeat-Request. Statisch/fest, da unabhaengig von Laufzeitwerten – wird
+ * serverseitig einmal pro Firmware-Version gespeichert (siehe POST /heartbeat/configuration). */
+static const char BRIDGE_MANIFEST_JSON[] =
+    "{\"properties\":{\"configuration\":{\"properties\":{"
+    "\"machine_name\":{\"type\":\"string\",\"title\":\"Maschinenname\"},"
+    "\"location\":{\"type\":\"string\",\"title\":\"Standort\"},"
+    "\"info_url\":{\"type\":\"string\",\"title\":\"Info-URL\"},"
+    "\"resource_id\":{\"type\":\"string\",\"title\":\"Anny-Ressourcen-ID\"},"
+    "\"idle_current\":{\"type\":\"number\",\"title\":\"Idle-Strom (A)\"},"
+    "\"sound_enabled\":{\"type\":\"boolean\",\"title\":\"Ton aktiviert\"},"
+    "\"idle_detection_enabled\":{\"type\":\"boolean\",\"title\":\"Idle-Erkennung aktiviert\"},"
+    "\"otp_required\":{\"type\":\"boolean\",\"title\":\"OTP erforderlich\"},"
+    "\"unlock_duration\":{\"type\":\"number\",\"title\":\"Freischaltdauer (Min)\"},"
+    "\"idle_shutdown_delay_s\":{\"type\":\"number\",\"title\":\"Idle-Abschaltverzögerung (s)\"},"
+    "\"auto_ota\":{\"type\":\"boolean\",\"title\":\"Automatische Updates\"},"
+    "\"superuser_uids\":{\"type\":\"array\",\"title\":\"SuperUser-UIDs\"}"
+    "}},\"telemetry\":{\"properties\":{"
+    "\"unlock_status\":{\"title\":\"Freischaltstatus\",\"enum\":[\"locked\",\"unlocked\",\"idle_pending\"],"
+    "\"x-enum-titles\":{\"locked\":\"Gesperrt\",\"unlocked\":\"Freigeschaltet\","
+    "\"idle_pending\":\"Wartet auf Idle-Abschaltung\"}},"
+    "\"unlock_remaining_min\":{\"title\":\"Verbleibende Zeit (Min)\"},"
+    "\"idle_current_mV\":{\"title\":\"Idle-Strom (mV)\"},"
+    "\"current_rms_a\":{\"title\":\"Strom RMS (A)\"},"
+    "\"ads0\":{\"title\":\"ADC Kanal 0\"},"
+    "\"ads1\":{\"title\":\"ADC Kanal 1\"},"
+    "\"ads2\":{\"title\":\"ADC Kanal 2\"},"
+    "\"ads3\":{\"title\":\"ADC Kanal 3\"},"
+    "\"pcf_input\":{\"title\":\"PCF8574 Eingänge\"}"
+    "}}}}";
+
+/* Freischaltstatus als Tri-State fuer Telemetrie: "locked" (Relay aus), "unlocked" (Freischalt-
+ * Timer laeuft noch), oder "idle_pending" (Timer bereits abgelaufen, Relay aber noch aktiv, weil
+ * die Idle-Erkennung noch auf ausreichend langen Ruhestrom wartet, siehe s_unlock_idle_pending
+ * in unlock_timer_cb()). idle_pending muss vor dem Timer-Check geprueft werden, da
+ * s_unlock_until_us beim Eintritt in den Idle-Pending-Zustand bereits auf 0 gesetzt wird. */
+static const char *bridge_unlock_status_text(void)
+{
+    if (s_unlock_idle_pending)
+    {
+        return "idle_pending";
+    }
+    if ((s_unlock_until_us > 0) && (esp_timer_get_time() < s_unlock_until_us))
+    {
+        return "unlocked";
+    }
+    return "locked";
+}
+
+/* Aktuelle Config-WERTE als JSON serialisieren (Gegenstueck zum "configuration"-Feld in
+ * parse_bridge_config_from_response()). config_version/fw_version sind bewusst NICHT enthalten:
+ * die sind Top-Level-Requestfelder, kein Teil der editierbaren Konfiguration. */
+static void bridge_cfg_to_configuration_json(const bridge_cfg_t *cfg, char *out, size_t out_size)
+{
+    char esc_name[128];
+    char esc_loc[128];
+    char esc_url[256];
+    char esc_res[48];
+    char uids_json[1600];
+
+    json_escape_string(cfg->machine_name, esc_name, sizeof(esc_name));
+    json_escape_string(cfg->location, esc_loc, sizeof(esc_loc));
+    json_escape_string(cfg->info_url, esc_url, sizeof(esc_url));
+    json_escape_string(cfg->resource_id, esc_res, sizeof(esc_res));
+    bridge_cfg_superuser_uids_to_json(cfg, uids_json, sizeof(uids_json));
+
+    snprintf(out, out_size,
+             "{\"machine_name\":\"%s\",\"location\":\"%s\",\"info_url\":\"%s\",\"resource_id\":\"%s\","
+             "\"idle_current\":%.3f,\"sound_enabled\":%s,\"idle_detection_enabled\":%s,"
+             "\"otp_required\":%s,\"unlock_duration\":%u,\"idle_shutdown_delay_s\":%u,"
+             "\"auto_ota\":%s,\"superuser_uids\":%s}",
+             esc_name, esc_loc, esc_url, esc_res,
+             (double)cfg->idle_current,
+             cfg->sound_enabled ? "true" : "false",
+             cfg->idle_detection_enabled ? "true" : "false",
+             cfg->otp_required ? "true" : "false",
+             (unsigned)cfg->unlock_duration_min,
+             (unsigned)cfg->idle_shutdown_delay_s,
+             cfg->auto_ota ? "true" : "false",
+             uids_json);
+}
+
+/* Sendet EINMALIG und SOFORT (nicht erst beim naechsten periodischen Intervall) den vollen
+ * Konfigurations-Upload an POST /heartbeat/configuration, direkt nachdem der Server per
+ * configuration_request:true signalisiert hat, dass er diese Bridge (device_id + fw_version)
+ * noch nicht kennt (Server-Neustart / neue Bridge / FW-Update). Laeuft synchron im
+ * Auth-Worker-Task, direkt im Anschluss an den normalen Heartbeat-Request. */
+static void send_heartbeat_with_manifest(void)
+{
+    char *configuration_json = malloc(2048);
+    char *manifest_escaped = malloc(2048);
+    char *payload = malloc(4096);
+    char response[1024] = {0};
+
+    if ((configuration_json == NULL) || (manifest_escaped == NULL) || (payload == NULL))
+    {
+        ESP_LOGE(TAG, "[HEARTBEAT] Konfigurations-Upload: Speicher fuer Payload konnte nicht alloziert werden");
+        free(configuration_json);
+        free(manifest_escaped);
+        free(payload);
+        return;
+    }
+
+    bridge_cfg_to_configuration_json(&s_bridge_cfg, configuration_json, 2048);
+    /* Das Manifest wird laut Server-API als JSON-STRING gesendet (nicht als verschachteltes
+     * Objekt) – der eigentliche JSON-Schema-Inhalt muss also selbst als String-Wert escaped
+     * werden. */
+    json_escape_string(BRIDGE_MANIFEST_JSON, manifest_escaped, 2048);
+
+    const bool unlocked = (s_unlock_until_us > 0) && (esp_timer_get_time() < s_unlock_until_us);
+    const uint32_t remaining_min = unlocked
+                                       ? (uint32_t)((s_unlock_until_us - esp_timer_get_time()) / 60000000ULL)
+                                       : 0U;
+    const float idle_mV = (s_idle_current_measured_mV >= 0.0f) ? s_idle_current_measured_mV : 0.0f;
+
+    snprintf(payload, 4096,
+             "{\"device_id\":\"%s\",\"fw_version\":\"" APP_VERSION "\",\"config_version\":\"%s\","
+             "\"telemetry\":{\"unlock_status\":\"%s\",\"unlock_remaining_min\":%u,"
+             "\"idle_current_mV\":%.3f,\"current_rms_a\":%.6f,"
+             "\"ads0\":%d,\"ads1\":%d,\"ads2\":%d,\"ads3\":%d,\"pcf_input\":%u},"
+             "\"manifest\":\"%s\",\"configuration\":%s}",
+             s_device_id[0] ? s_device_id : "unknown",
+             s_bridge_cfg.config_version,
+             bridge_unlock_status_text(),
+             remaining_min, idle_mV, (double)s_current_rms_a,
+             s_ads_raw[0], s_ads_raw[1], s_ads_raw[2], s_ads_raw[3], (unsigned)s_pcf_input,
+             manifest_escaped,
+             configuration_json);
+
+    s_last_heartbeat_us = esp_timer_get_time();
+
+    int http_status = 0;
+    bool ok = false;
+    ESP_LOGI(TAG, "[HEARTBEAT] Sende einmaligen Konfigurations-Upload (%d Bytes Payload)", (int)strlen(payload));
+    esp_err_t err = https_post_json(AUTH_URL_CONFIGURATION, payload, &http_status, &ok, response, sizeof(response), NULL, 0);
+    ESP_LOGI(TAG, "[HEARTBEAT] Konfigurations-Upload: err=%s status=%d ok=%d response=%s",
+             esp_err_to_name(err), http_status, (int)ok, response);
+    /* Server antwortet bei Erfolg immer mit "{}" (siehe POST /heartbeat/configuration) – kein
+     * Echo auszuwerten. */
+
+    free(configuration_json);
+    free(manifest_escaped);
+    free(payload);
+}
+
+/* Naechste/laufende Buchung der Ressource ueber GET /bookings/{Ressourcen-ID} holen und in
+ * s_next_res_* ablegen. Der Server liefert Beginn/Ende als Millisekunden ab Antwort
+ * (starts_in_ms/ends_in_ms), die Liste ist nach Beginn sortiert – der erste Eintrag ist die
+ * laufende oder naechste Buchung. Fuer die Anzeige werden daraus Lokalzeit-Strings
+ * ("YYYY-MM-DDTHH:MM") gerechnet, daher ist eine SNTP-Synchronisation Voraussetzung. */
+static void fetch_next_reservation(void)
+{
+    char url[96] = {0};
+    char response[1024] = {0};
+    int http_status = 0;
+    bool ok = false;
+
+    s_has_next_reservation = false;
+    s_next_res_name[0] = '\0';
+
+    if ((s_bridge_cfg.resource_id[0] == '\0') || !s_sntp_ever_synced)
+    {
+        ESP_LOGI(TAG, "[BOOKINGS] uebersprungen (resource_id=%s sntp=%d)",
+                 s_bridge_cfg.resource_id[0] ? s_bridge_cfg.resource_id : "<leer>", (int)s_sntp_ever_synced);
+        return;
+    }
+
+    snprintf(url, sizeof(url), "%s%s", AUTH_URL_BOOKINGS, s_bridge_cfg.resource_id);
+    https_get_json(url, &http_status, &ok, response, sizeof(response));
+    if (!ok)
+    {
+        ESP_LOGW(TAG, "[BOOKINGS] Abruf fehlgeschlagen: status=%d", http_status);
+        return;
+    }
+
+    /* Leere Liste: kein "booking_id" in der Antwort */
+    if (strstr(response, "\"booking_id\"") == NULL)
+    {
+        ESP_LOGI(TAG, "[BOOKINGS] Keine Buchungen");
+        return;
+    }
+
+    char name[sizeof(s_next_res_name)] = {0};
+    int64_t starts_in_ms = extract_json_int64(response, "starts_in_ms", 0);
+    int64_t ends_in_ms = extract_json_int64(response, "ends_in_ms", 0);
+    if (!extract_json_string(response, "resource_name", name, sizeof(name)) || (ends_in_ms <= 0))
+    {
+        ESP_LOGW(TAG, "[BOOKINGS] Antwort nicht auswertbar: %s", response);
+        return;
+    }
+
+    time_t now = time(NULL);
+    time_t start_epoch = now + (time_t)(starts_in_ms / 1000);
+    time_t end_epoch = now + (time_t)(ends_in_ms / 1000);
+    struct tm tm_start, tm_end;
+    localtime_r(&start_epoch, &tm_start);
+    localtime_r(&end_epoch, &tm_end);
+    snprintf(s_next_res_start, sizeof(s_next_res_start), "%04d-%02d-%02dT%02d:%02d",
+             tm_start.tm_year + 1900, tm_start.tm_mon + 1, tm_start.tm_mday, tm_start.tm_hour, tm_start.tm_min);
+    snprintf(s_next_res_end, sizeof(s_next_res_end), "%04d-%02d-%02dT%02d:%02d",
+             tm_end.tm_year + 1900, tm_end.tm_mon + 1, tm_end.tm_mday, tm_end.tm_hour, tm_end.tm_min);
+    strncpy(s_next_res_name, name, sizeof(s_next_res_name) - 1);
+    s_has_next_reservation = (s_next_res_name[0] != '\0');
+    ESP_LOGI(TAG, "[BOOKINGS] Reservierung: '%s'  %s -> %s", s_next_res_name, s_next_res_start, s_next_res_end);
+}
+
 static void auth_worker_task(void *arg)
 {
     LV_UNUSED(arg);
@@ -1894,7 +2492,7 @@ static void auth_worker_task(void *arg)
 
         char payload[512] = {0};
         char response[1024] = {0}; /* 1024 Bytes: Platz für Config + Reservierungsdaten */
-        const char *url = AUTH_URL_NFC;
+        const char *url = AUTH_URL_ACTIVATIONS;
 
         res.source = req.source;
         res.success = false;
@@ -1903,56 +2501,67 @@ static void auth_worker_task(void *arg)
         res.unlock_duration_min = 0;
         res.token[0] = '\0';
 
-        if (req.source == AUTH_SRC_SETUP)
         {
-            snprintf(payload, sizeof(payload), "{\"mac\":\"%s\",\"fw_version\":\"" APP_VERSION "\"}", req.value_a);
-            url = AUTH_URL_SETUP;
+            wifi_ap_record_t ap = {0};
+            if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK)
+            {
+                ESP_LOGI(TAG, "[WIFI] RSSI=%d dBm channel=%u heap=%u", (int)ap.rssi, (unsigned)ap.primary, (unsigned)esp_get_free_heap_size());
+            }
         }
-        else if (req.source == AUTH_SRC_HEARTBEAT)
+
+        if (req.source == AUTH_SRC_HEARTBEAT)
         {
-            int64_t until = s_unlock_until_us;
-            int64_t now_us = esp_timer_get_time();
-            bool unlocked = (until > 0) && (until > now_us);
-            int remaining_min = unlocked ? (int)((until - now_us) / 60000000) : 0;
-            sensors_read(); /* ADS1115 + PCF8574T vor Payload lesen (~62 ms) */
-            char idle_part[64] = "";
-            if (s_idle_current_measured_mV >= 0.0f)
-            {
-                snprintf(idle_part, sizeof(idle_part), ",\"idle_current_a\":%.3f,\"current_rms_a\":%.3f",
-                         (double)s_idle_current_measured_mV, (double)s_current_rms_a);
-            }
-            else
-            {
-                snprintf(idle_part, sizeof(idle_part), ",\"current_rms_a\":%.3f",
-                         (double)s_current_rms_a);
-            }
+            const bool heartbeat_unlocked = (s_unlock_until_us > 0) && (esp_timer_get_time() < s_unlock_until_us);
+            const uint32_t heartbeat_remaining_min = heartbeat_unlocked
+                                                         ? (uint32_t)((s_unlock_until_us - esp_timer_get_time()) / 60000000ULL)
+                                                         : 0U;
+            const float heartbeat_idle_mV = (s_idle_current_measured_mV >= 0.0f) ? s_idle_current_measured_mV : 0.0f;
+
+            /* LiMa_Server2 erwartet alle Statuswerte verschachtelt unter "telemetry" (ein
+             * beliebiges JSON-Objekt aus Server-Sicht) statt flach im Request-Root. */
             snprintf(payload, sizeof(payload),
-                     "{\"token\":\"%s\",\"config_version\":%lu,\"unlock_status\":\"%s\",\"unlock_remaining_min\":%d,\"fw_version\":\"" APP_VERSION "\",\"ads\":[%d,%d,%d,%d],\"pcf\":%u%s}",
-                     s_auth_cfg.token, (unsigned long)s_bridge_cfg.config_version,
-                     unlocked ? "unlocked" : "locked", remaining_min,
-                     (int)s_ads_raw[0], (int)s_ads_raw[1], (int)s_ads_raw[2], (int)s_ads_raw[3],
-                     (unsigned)s_pcf_input, idle_part);
+                     "{\"device_id\":\"%s\",\"fw_version\":\"" APP_VERSION "\",\"config_version\":\"%s\","
+                     "\"telemetry\":{\"unlock_status\":\"%s\",\"unlock_remaining_min\":%u,"
+                     "\"idle_current_mV\":%.3f,\"current_rms_a\":%.6f,"
+                     "\"ads0\":%d,\"ads1\":%d,\"ads2\":%d,\"ads3\":%d,\"pcf_input\":%u}}",
+                     s_device_id[0] ? s_device_id : "unknown",
+                     s_bridge_cfg.config_version,
+                     bridge_unlock_status_text(),
+                     heartbeat_remaining_min,
+                     heartbeat_idle_mV,
+                     (double)s_current_rms_a,
+                     s_ads_raw[0],
+                     s_ads_raw[1],
+                     s_ads_raw[2],
+                     s_ads_raw[3],
+                     (unsigned)s_pcf_input);
             url = AUTH_URL_HEARTBEAT;
         }
         else if (req.source == AUTH_SRC_NFC)
         {
-            snprintf(payload, sizeof(payload), "{\"token\":\"%s\",\"uid\":\"%s\"}", s_auth_cfg.token, req.value_a);
-            url = AUTH_URL_NFC;
+            if (s_bridge_cfg.resource_id[0] == '\0')
+            {
+                ESP_LOGW(TAG, "[AUTH] resource_id nicht konfiguriert – Server antwortet mit 400");
+            }
+            snprintf(payload, sizeof(payload),
+                     "{\"card_id\":\"%s\",\"device_id\":\"%s\",\"resource_id\":\"%s\"}",
+                     req.value_a, s_device_id[0] ? s_device_id : "unknown", s_bridge_cfg.resource_id);
+            url = AUTH_URL_ACTIVATIONS;
         }
         else if (req.source == AUTH_SRC_LOGIN)
         {
             snprintf(payload, sizeof(payload), "{\"token\":\"%s\",\"email\":\"%s\",\"password\":\"%s\"}", s_auth_cfg.token, req.value_a, req.value_b);
-            url = AUTH_URL_LOGIN;
+            url = AUTH_URL_ACTIVATIONS;
         }
         else if (req.source == AUTH_SRC_REGISTER_CARD)
         {
             snprintf(payload, sizeof(payload), "{\"token\":\"%s\",\"uid\":\"%s\"}", s_auth_cfg.token, req.value_a);
-            url = AUTH_URL_REGISTER_CARD;
+            url = AUTH_URL_ACTIVATIONS;
         }
         else
         {
             snprintf(payload, sizeof(payload), "{\"token\":\"%s\",\"pin\":\"%s\"}", s_auth_cfg.token, req.value_a);
-            url = AUTH_URL_PIN;
+            url = AUTH_URL_ACTIVATION_DECISION;
         }
 
         bool ok = false;
@@ -1960,8 +2569,16 @@ static void auth_worker_task(void *arg)
         for (int attempt = 0; attempt <= AUTH_HTTP_RETRY_COUNT; attempt++)
         {
             response[0] = '\0';
+            ESP_LOGI(TAG, "[HTTP] %s attempt=%d payload=%s", url, attempt, payload);
             err = https_post_json(url, payload, &res.http_status, &ok, response, sizeof(response), res.token, sizeof(res.token));
             res.success = (err == ESP_OK) && ok;
+            ESP_LOGI(TAG, "[HTTP] %s attempt=%d status=%d ok=%d response=%s token_hdr=%s",
+                     url,
+                     attempt,
+                     res.http_status,
+                     (int)ok,
+                     response,
+                     res.token);
 
             if ((req.source == AUTH_SRC_SETUP) && (s_setup_log_verbose || !ok))
             {
@@ -1981,7 +2598,7 @@ static void auth_worker_task(void *arg)
                     {
                         parse_bridge_config_from_response(response);
                     }
-                    else if (s_bridge_cfg.config_version > 0)
+                    else if (bridge_cfg_is_configured(&s_bridge_cfg))
                     {
                         ESP_LOGW(TAG, "Server reports unconfigured, clearing local config");
                         bridge_cfg_set_defaults(&s_bridge_cfg);
@@ -1991,26 +2608,23 @@ static void auth_worker_task(void *arg)
             }
             if ((req.source == AUTH_SRC_HEARTBEAT) && res.success)
             {
-                if (extract_json_bool(response, "config_changed"))
+                /* parse_bridge_config_from_response() prueft selbst, ob ein "configuration"-
+                 * Objekt vorhanden ist (Admin hat eine Aenderung hinterlegt, wird vom Server
+                 * unabhaengig vom config_version-Hash ausgeliefert, sobald vorhanden – sonst
+                 * ein No-Op). */
+                parse_bridge_config_from_response(response);
+
+                /* Server kennt diese Bridge (device_id + fw_version) noch GAR NICHT (Neustart /
+                 * neue Bridge / FW-Update) – sofort (nicht erst beim naechsten periodischen
+                 * Intervall) Manifest + aktuelle Konfiguration hochladen. */
+                if (extract_json_bool(response, "configuration_request"))
                 {
-                    parse_bridge_config_from_response(response);
+                    ESP_LOGI(TAG, "[HEARTBEAT] Server fordert Konfigurations-Upload an (configuration_request=true)");
+                    send_heartbeat_with_manifest();
                 }
-                /* Reservierungsdaten aus Heartbeat-Antwort lesen */
-                if (strstr(response, "\"res_name\"") != NULL)
-                {
-                    extract_json_string(response, "res_name", s_next_res_name, sizeof(s_next_res_name));
-                    extract_json_string(response, "res_start", s_next_res_start, sizeof(s_next_res_start));
-                    extract_json_string(response, "res_end", s_next_res_end, sizeof(s_next_res_end));
-                    s_has_next_reservation = (s_next_res_name[0] != '\0');
-                    ESP_LOGI(TAG, "[HEARTBEAT] Reservierung empfangen: '%s'  %s -> %s",
-                             s_next_res_name, s_next_res_start, s_next_res_end);
-                }
-                else
-                {
-                    s_has_next_reservation = false;
-                    s_next_res_name[0] = '\0';
-                    ESP_LOGI(TAG, "[HEARTBEAT] Keine Reservierung empfangen");
-                }
+
+                /* Reservierungen separat ueber GET /bookings/{Ressourcen-ID} holen */
+                fetch_next_reservation();
                 if (bsp_display_lock(50))
                 {
                     update_reservation_display_locked();
@@ -2020,6 +2634,32 @@ static void auth_worker_task(void *arg)
             if (((req.source == AUTH_SRC_NFC) || (req.source == AUTH_SRC_LOGIN)) && res.success)
             {
                 res.pin_required = extract_json_bool(response, "pin_required");
+            }
+            if (req.source == AUTH_SRC_NFC)
+            {
+                s_activation_url[0] = '\0';
+                s_activation_code[0] = '\0';
+                s_activation_expires_at_us = 0;
+                ESP_LOGI(TAG, "[AUTH] activations response: status=%d ok=%d body=%s", res.http_status, (int)ok, response);
+                if (extract_json_string(response, "url", s_activation_url, sizeof(s_activation_url)))
+                {
+                    ESP_LOGI(TAG, "[AUTH] activation URL parsed: %s", s_activation_url);
+                    extract_code_from_url(s_activation_url, s_activation_code, sizeof(s_activation_code));
+                    int64_t expires_at_ms = extract_json_int64(response, "expiresAt", 0);
+                    if (expires_at_ms > 0)
+                    {
+                        s_activation_expires_at_us = expires_at_ms * 1000LL;
+                        ESP_LOGI(TAG, "[AUTH] activation expiresAt=%lld ms -> expires_us=%lld", (long long)expires_at_ms, (long long)s_activation_expires_at_us);
+                    }
+                    else
+                    {
+                        ESP_LOGW(TAG, "[AUTH] activation response missing expiresAt");
+                    }
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "[AUTH] no URL field found in activations response");
+                }
             }
             if (res.success)
             {
@@ -2108,6 +2748,95 @@ static void update_machine_info_ui(void)
 /* Vorwaertsdeklaration (Definition weiter unten, nach OTA-Sektion) */
 static void auto_ota_task(void *arg);
 
+static void activation_poll_timer_cb(lv_timer_t *timer)
+{
+    char decision_url[256] = {0};
+    char response[1024] = {0};
+    int http_status = 0;
+    bool ok = false;
+
+    LV_UNUSED(timer);
+    if ((s_activation_url[0] == '\0') && (s_activation_code[0] == '\0'))
+    {
+        return;
+    }
+
+    if (s_activation_expires_at_us > 0 && (int64_t)time(NULL) * 1000000LL >= s_activation_expires_at_us)
+    {
+        beep(3);
+        show_activation_url_on_display();
+        clear_activation_state();
+        return;
+    }
+
+    show_activation_url_on_display();
+
+    if (s_activation_code[0] == '\0')
+    {
+        return;
+    }
+
+    snprintf(decision_url, sizeof(decision_url), "%s%s", AUTH_URL_ACTIVATION_DECISION, s_activation_code);
+    https_get_json(decision_url, &http_status, &ok, response, sizeof(response));
+
+    if (http_status == 200)
+    {
+        /* Server liefert bei Erfolg {remaining_ms, booking_id}: Restzeit der Buchung (bzw. der
+         * Wartungsfreigabe) in Millisekunden ab Antwort – keine Uhrzeit noetig. */
+        uint32_t unlock_min = (s_bridge_cfg.unlock_duration_min > 0) ? s_bridge_cfg.unlock_duration_min : 30;
+        int64_t remaining_ms = extract_json_int64(response, "remaining_ms", -1);
+        if (remaining_ms > 0)
+        {
+            int64_t remaining_min = remaining_ms / 60000;
+            if (remaining_min < 1)
+            {
+                remaining_min = 1;
+            }
+            else if (remaining_min > 1440)
+            {
+                remaining_min = 1440;
+            }
+            unlock_min = (uint32_t)remaining_min;
+            ESP_LOGI(TAG, "[ACTIVATION] remaining_ms=%lld -> Freischaltung fuer %u Min.", (long long)remaining_ms, (unsigned)unlock_min);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "[ACTIVATION] Keine auswertbare remaining_ms in der Antwort, nutze konfigurierte Dauer (%u Min.)", (unsigned)unlock_min);
+        }
+        beep(2);
+        activate_unlock(unlock_min);
+        show_result_page(true, "Freigeschaltet");
+        clear_activation_state();
+        return;
+    }
+
+    if (http_status == 403)
+    {
+        char msg[128] = {0};
+        if (!extract_json_string(response, "error", msg, sizeof(msg)))
+        {
+            snprintf(msg, sizeof(msg), "Zugriff verweigert");
+        }
+        beep(3);
+        show_result_page(false, msg);
+        clear_activation_state();
+        return;
+    }
+
+    if (http_status == 404)
+    {
+        beep(3);
+        show_result_page(false, "Session abgelaufen");
+        clear_activation_state();
+        return;
+    }
+
+    if (http_status >= 500)
+    {
+        set_status_text("Serverfehler bei Freigabe", lv_color_hex(0xFCA5A5));
+    }
+}
+
 static void auth_result_timer_cb(lv_timer_t *timer)
 {
     LV_UNUSED(timer);
@@ -2124,7 +2853,7 @@ static void auth_result_timer_cb(lv_timer_t *timer)
             s_bridge_cfg_updated = false;
             bridge_cfg_save(&s_bridge_cfg);
             update_machine_info_ui();
-            ESP_LOGI(TAG, "Bridge config saved to NVS (ver=%lu)", (unsigned long)s_bridge_cfg.config_version);
+            ESP_LOGI(TAG, "Bridge config saved to NVS (ver=%s)", s_bridge_cfg.config_version);
         }
 
         if (res.source == AUTH_SRC_SETUP)
@@ -2136,7 +2865,7 @@ static void auth_result_timer_cb(lv_timer_t *timer)
                 auth_cfg_save(&s_auth_cfg);
                 s_setup_log_verbose = false;
                 ESP_LOGI(TAG, "Setup success, token stored: %s", s_auth_cfg.token);
-                if (s_bridge_cfg.config_version > 0)
+                if (bridge_cfg_is_configured(&s_bridge_cfg))
                 {
                     set_status_text("Geraet registriert", lv_color_hex(0x86EFAC));
                 }
@@ -2147,7 +2876,8 @@ static void auth_result_timer_cb(lv_timer_t *timer)
                 if (s_bridge_cfg.auto_ota && !s_auto_ota_in_progress)
                 {
                     s_auto_ota_in_progress = true;
-                    xTaskCreatePinnedToCore(auto_ota_task, "auto_ota", 8192, NULL, 4, NULL, AUTH_TASK_CORE_ID);
+                    /* 12288 statt 8192, siehe Kommentar bei auth_worker: HTTPS-OTA braucht mind. genauso viel Stack. */
+                    xTaskCreatePinnedToCore(auto_ota_task, "auto_ota", 12288, NULL, 4, NULL, AUTH_TASK_CORE_ID);
                 }
             }
             else if (server_unreachable)
@@ -2167,10 +2897,12 @@ static void auth_result_timer_cb(lv_timer_t *timer)
         {
             if (res.success)
             {
-                if (s_bridge_cfg.config_version > 0)
+                if (bridge_cfg_is_configured(&s_bridge_cfg))
                 {
                     ESP_LOGI(TAG, "Heartbeat OK (konfiguriert)");
-                    set_status_text("Token gültig", lv_color_hex(0x86EFAC));
+                    // set_status_text("Token gültig", lv_color_hex(0x86EFAC));
+                    set_nfc_uid_text("Token gültig", lv_color_hex(0x86EFAC));
+                    set_status_text("Bitte HSD Karte anlegen", lv_color_hex(0x93C5FD));
                 }
                 else
                 {
@@ -2180,7 +2912,8 @@ static void auth_result_timer_cb(lv_timer_t *timer)
                 if (s_bridge_cfg.auto_ota && !s_auto_ota_in_progress)
                 {
                     s_auto_ota_in_progress = true;
-                    xTaskCreatePinnedToCore(auto_ota_task, "auto_ota", 8192, NULL, 4, NULL, AUTH_TASK_CORE_ID);
+                    /* 12288 statt 8192, siehe Kommentar bei auth_worker: HTTPS-OTA braucht mind. genauso viel Stack. */
+                    xTaskCreatePinnedToCore(auto_ota_task, "auto_ota", 12288, NULL, 4, NULL, AUTH_TASK_CORE_ID);
                 }
             }
             else if ((res.http_status >= 400) && (res.http_status < 500))
@@ -2221,6 +2954,35 @@ static void auth_result_timer_cb(lv_timer_t *timer)
             {
                 beep(3);
                 show_result_page(false, "Registrierung fehlgeschlagen");
+            }
+            continue;
+        }
+
+        if (res.source == AUTH_SRC_NFC)
+        {
+            if (s_activation_url[0] != '\0')
+            {
+                show_view(APP_VIEW_START);
+                show_activation_url_on_display();
+                if (s_activation_poll_timer == NULL)
+                {
+                    s_activation_poll_timer = lv_timer_create(activation_poll_timer_cb, 1500, NULL);
+                    lv_timer_set_repeat_count(s_activation_poll_timer, -1);
+                }
+                continue;
+            }
+            else if (res.success)
+            {
+                show_result_page(true, "Aktivierung gestartet");
+            }
+            else if (server_unreachable)
+            {
+                show_result_page(false, "Server nicht erreichbar");
+            }
+            else
+            {
+                beep(3);
+                show_result_page(false, "Verweigert");
             }
             continue;
         }
@@ -2469,7 +3231,7 @@ static void register_card_event_cb(lv_event_t *event)
 #endif
 }
 
-/* Login-Modal öffnen und NFC-Polling pausieren */
+/* Startet die Authentifizierung direkt über den activations-Endpunkt */
 static void login_open_event_cb(lv_event_t *event)
 {
     LV_UNUSED(event);
@@ -2477,13 +3239,26 @@ static void login_open_event_cb(lv_event_t *event)
     {
         return;
     }
-    s_pause_nfc_polling = true;
-    if (!bsp_display_lock(100))
+    if (!auth_has_token())
     {
+        set_status_text("Gerät noch nicht registriert", lv_color_hex(0xFCA5A5));
         return;
     }
-    lv_obj_clear_flag(s_ui.login_modal, LV_OBJ_FLAG_HIDDEN);
-    bsp_display_unlock();
+
+    auth_request_t req = {.source = AUTH_SRC_NFC};
+    req.value_a[0] = '\0';
+    if (s_auth_cfg.mac[0] != '\0')
+    {
+        strncpy(req.value_a, s_auth_cfg.mac, sizeof(req.value_a) - 1);
+        req.value_a[sizeof(req.value_a) - 1] = '\0';
+    }
+    if (!enqueue_auth_request(&req))
+    {
+        set_status_text("Queue voll", lv_color_hex(0xFCA5A5));
+        return;
+    }
+    set_auth_busy(true);
+    set_status_text("Authentifizierung wird gestartet...", lv_color_hex(0xFDE68A));
 }
 
 #if !ENABLE_NFC
@@ -2650,7 +3425,7 @@ static void ota_task(void *arg)
     set_ota_status_text("Firmware wird heruntergeladen...", lv_color_hex(0xFDE68A));
 
     char url_with_token[256] = {0};
-    snprintf(url_with_token, sizeof(url_with_token), "%s?token=%s", OTA_URL_FIRMWARE, s_auth_cfg.token);
+    snprintf(url_with_token, sizeof(url_with_token), "%s?token=%s", OTA_URL_FIRMWARE, auth_active_token());
 
     esp_http_client_config_t http_cfg = {
         .url = url_with_token,
@@ -2711,7 +3486,7 @@ static void ota_check_event_cb(lv_event_t *event)
 
     /* Prüfe ob neue Version verfügbar */
     char url[256] = {0};
-    snprintf(url, sizeof(url), "%s?token=%s&version=%s", OTA_URL_CHECK, s_auth_cfg.token, APP_VERSION);
+    snprintf(url, sizeof(url), "%s?token=%s&version=%s", OTA_URL_CHECK, auth_active_token(), APP_VERSION);
 
     char response_buf[256] = {0};
     http_capture_t cap = {
@@ -2808,7 +3583,7 @@ static void ota_check_event_cb(lv_event_t *event)
     }
     set_ota_status_text(ver_msg, lv_color_hex(0xFDE68A));
 
-    BaseType_t ota_ok = xTaskCreatePinnedToCore(ota_task, "ota_task", 8192, NULL, 4, NULL, AUTH_TASK_CORE_ID);
+    BaseType_t ota_ok = xTaskCreatePinnedToCore(ota_task, "ota_task", 12288, NULL, 4, NULL, AUTH_TASK_CORE_ID);
     if (ota_ok != pdPASS)
     {
         ESP_LOGE(TAG, "OTA task creation failed");
@@ -2836,7 +3611,7 @@ static void auto_ota_task(void *arg)
     }
 
     char url[256] = {0};
-    snprintf(url, sizeof(url), "%s?token=%s&version=%s", OTA_URL_CHECK, s_auth_cfg.token, APP_VERSION);
+    snprintf(url, sizeof(url), "%s?token=%s&version=%s", OTA_URL_CHECK, auth_active_token(), APP_VERSION);
 
     char response_buf[256] = {0};
     http_capture_t cap = {
@@ -2902,7 +3677,7 @@ static void auto_ota_task(void *arg)
     set_ota_status_text("Auto-Update wird heruntergeladen...", lv_color_hex(0xFDE68A));
 
     char url_fw[256] = {0};
-    snprintf(url_fw, sizeof(url_fw), "%s?token=%s", OTA_URL_FIRMWARE, s_auth_cfg.token);
+    snprintf(url_fw, sizeof(url_fw), "%s?token=%s", OTA_URL_FIRMWARE, auth_active_token());
 
     esp_http_client_config_t fw_cfg = {
         .url = url_fw,
@@ -3173,20 +3948,22 @@ static void status_update_info(void)
                  "Maschine: %s\n"
                  "Standort: %s\n"
                  "Info URL: %s\n"
+                 "Ressourcen-ID: %s\n"
                  "Idle Strom: %.2f A\n"
                  "Sound: %s\n"
                  "Idle-Erkennung: %s\n"
                  "Freischaltung: %s\n"
-                 "Config Version: %lu",
-                 s_bridge_cfg.config_version > 0 ? "Konfiguriert" : "Unkonfiguriert",
+                 "Config Hash: %s",
+                 bridge_cfg_is_configured(&s_bridge_cfg) ? "Konfiguriert" : "Unkonfiguriert",
                  s_bridge_cfg.machine_name[0] ? s_bridge_cfg.machine_name : "-",
                  s_bridge_cfg.location[0] ? s_bridge_cfg.location : "-",
                  s_bridge_cfg.info_url[0] ? s_bridge_cfg.info_url : "-",
+                 s_bridge_cfg.resource_id[0] ? s_bridge_cfg.resource_id : "-",
                  s_bridge_cfg.idle_current,
                  s_bridge_cfg.sound_enabled ? "An" : "Aus",
                  s_bridge_cfg.idle_detection_enabled ? "An" : "Aus",
                  unlock_str,
-                 (unsigned long)s_bridge_cfg.config_version);
+                 s_bridge_cfg.config_version[0] ? s_bridge_cfg.config_version : "-");
         lv_label_set_text(s_ui.status_bridge_label, buf);
     }
 
@@ -3346,6 +4123,32 @@ static void status_tab_bridge_cb(lv_event_t *event)
     status_show_tab(1);
 }
 
+/* Button "Konfiguration abrufen": Heartbeat sofort einreihen statt auf das Intervall zu warten.
+ * Der Heartbeat liefert eine wartende Wunsch-Konfiguration aus (parse_bridge_config_from_response)
+ * und loest bei Bedarf den Konfigurations-Upload aus; danach werden auch die Buchungen geholt. */
+static void bridge_sync_btn_cb(lv_event_t *event)
+{
+    LV_UNUSED(event);
+    if (!ui_btn_ok())
+    {
+        return;
+    }
+    if (!s_wifi_has_ip)
+    {
+        set_status_text("Kein Netzwerk", lv_color_hex(0xFCA5A5));
+        return;
+    }
+    if (enqueue_token_check_request_if_needed())
+    {
+        s_last_heartbeat_us = esp_timer_get_time();
+        set_status_text("Konfiguration wird abgerufen...", lv_color_hex(0xFDE68A));
+    }
+    else
+    {
+        set_status_text("Bridge beschaeftigt oder nicht registriert", lv_color_hex(0xFCA5A5));
+    }
+}
+
 /* Tab-Callback: System-Tab aktivieren */
 static void status_tab_system_cb(lv_event_t *event)
 {
@@ -3397,7 +4200,7 @@ static void heartbeat_timer_cb(lv_timer_t *timer)
     }
 
     int64_t now_us = esp_timer_get_time();
-    int64_t interval_ms = (s_bridge_cfg.config_version > 0) ? HEARTBEAT_INTERVAL_MS : HEARTBEAT_INTERVAL_UNCONFIGURED_MS;
+    int64_t interval_ms = bridge_cfg_is_configured(&s_bridge_cfg) ? HEARTBEAT_INTERVAL_MS : HEARTBEAT_INTERVAL_UNCONFIGURED_MS;
     if ((s_last_heartbeat_us != 0) && ((now_us - s_last_heartbeat_us) < (interval_ms * 1000)))
     {
         return;
@@ -3857,6 +4660,7 @@ static void idle_measure_task(void *arg)
 
     /* Persistent speichern */
     s_bridge_cfg.idle_current = rms_a;
+    bridge_cfg_compute_hash(&s_bridge_cfg, s_bridge_cfg.config_version); /* Hash lokal aktualisieren */
     s_bridge_cfg_updated = true;
 
     char msg[72];
@@ -4003,6 +4807,47 @@ static void create_ui(void)
     lv_obj_set_scrollbar_mode(s_ui.start_container, LV_SCROLLBAR_MODE_OFF);
     lv_obj_clear_flag(s_ui.start_container, LV_OBJ_FLAG_SCROLLABLE);
 
+    s_ui.activation_overlay = lv_obj_create(screen);
+    lv_obj_set_size(s_ui.activation_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(s_ui.activation_overlay, lv_color_hex(0x0B1220), 0);
+    lv_obj_set_style_bg_opa(s_ui.activation_overlay, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_ui.activation_overlay, 0, 0);
+    lv_obj_set_style_pad_all(s_ui.activation_overlay, 20, 0);
+    lv_obj_set_layout(s_ui.activation_overlay, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(s_ui.activation_overlay, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_ui.activation_overlay, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(s_ui.activation_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_ui.activation_overlay);
+
+    s_ui.activation_hint_label = lv_label_create(s_ui.activation_overlay);
+    lv_label_set_text(s_ui.activation_hint_label, "Bitte im Browser anmelden");
+    lv_obj_set_style_text_font(s_ui.activation_hint_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_ui.activation_hint_label, lv_color_hex(0xF9FAFB), 0);
+    lv_obj_set_width(s_ui.activation_hint_label, lv_pct(100));
+    lv_label_set_long_mode(s_ui.activation_hint_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(s_ui.activation_hint_label, LV_TEXT_ALIGN_CENTER, 0);
+
+    s_ui.activation_qr = lv_qrcode_create(s_ui.activation_overlay);
+    /* lv_qrcode ist ein lv_canvas: lv_obj_set_size() aendert nur die Rand-Box, nicht den
+     * gerenderten QR-Inhalt (Canvas-Buffer) – dafuer ist lv_qrcode_set_size() nötig. */
+    lv_qrcode_set_size(s_ui.activation_qr, 250);
+    lv_qrcode_set_dark_color(s_ui.activation_qr, lv_color_hex(0x000000));
+    lv_qrcode_set_light_color(s_ui.activation_qr, lv_color_hex(0xFFFFFF));
+    lv_obj_set_style_bg_color(s_ui.activation_qr, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(s_ui.activation_qr, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(s_ui.activation_qr, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_border_width(s_ui.activation_qr, 2, 0);
+    lv_obj_set_style_radius(s_ui.activation_qr, 12, 0);
+    lv_obj_add_flag(s_ui.activation_qr, LV_OBJ_FLAG_HIDDEN);
+
+    s_ui.activation_url_label = lv_label_create(s_ui.activation_overlay);
+    lv_label_set_text(s_ui.activation_url_label, "");
+    lv_obj_set_style_text_font(s_ui.activation_url_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_ui.activation_url_label, lv_color_hex(0xFDE68A), 0);
+    lv_obj_set_width(s_ui.activation_url_label, lv_pct(100));
+    lv_label_set_long_mode(s_ui.activation_url_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(s_ui.activation_url_label, LV_TEXT_ALIGN_CENTER, 0);
+
     /* HSD Logo — über dem Maschinennamen */
     lv_obj_t *hsd_logo_img = lv_image_create(s_ui.start_container);
     lv_image_set_src(hsd_logo_img, &hsd_logo);
@@ -4041,7 +4886,7 @@ static void create_ui(void)
 #if LV_USE_QRCODE
     /* QR-Code (links) */
     s_ui.qr_code = lv_qrcode_create(info_row);
-    lv_qrcode_set_size(s_ui.qr_code, 120);
+    lv_qrcode_set_size(s_ui.qr_code, 134); /* 2/3 von 200 */
     lv_qrcode_set_dark_color(s_ui.qr_code, lv_color_hex(0x000000));
     lv_qrcode_set_light_color(s_ui.qr_code, lv_color_hex(0xFFFFFF));
     lv_obj_set_style_border_color(s_ui.qr_code, lv_color_hex(0xFFFFFF), 0);
@@ -4052,6 +4897,7 @@ static void create_ui(void)
     /* Textspalte (rechts neben QR-Code) */
     lv_obj_t *info_col = lv_obj_create(info_row);
     lv_obj_set_flex_grow(info_col, 1);
+    lv_obj_set_width(info_col, lv_pct(100));
     lv_obj_set_height(info_col, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(info_col, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(info_col, 0, 0);
@@ -4062,21 +4908,16 @@ static void create_ui(void)
     lv_obj_set_scrollbar_mode(info_col, LV_SCROLLBAR_MODE_OFF);
     lv_obj_clear_flag(info_col, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *title = lv_label_create(info_col);
+    /*lv_obj_t *title = lv_label_create(info_col);
     lv_label_set_text(title, "Bitte HSD Karte anlegen");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0xF9FAFB), 0);
     lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(title, lv_pct(100));
-
-    lv_obj_t *hint = lv_label_create(info_col);
-    lv_label_set_text(hint, "oder HSD Login verwenden.");
-    lv_obj_set_style_text_color(hint, lv_color_hex(0xCBD5E1), 0);
-    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(hint, lv_pct(100));
+    lv_obj_set_width(title, lv_pct(100));*/
 
     s_ui.status_label = lv_label_create(info_col);
     lv_label_set_text(s_ui.status_label, "Bitte HSD Karte anlegen");
+    lv_obj_set_style_text_font(s_ui.status_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_ui.status_label, lv_color_hex(0x93C5FD), 0);
     lv_label_set_long_mode(s_ui.status_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(s_ui.status_label, lv_pct(100));
@@ -4089,23 +4930,27 @@ static void create_ui(void)
     lv_obj_set_width(s_ui.nfc_uid_label, lv_pct(100));
 #endif
 
-    /* Reservierungs-Banner — amber, versteckt bis Reservierung vorhanden */
-    s_ui.reservation_banner = lv_obj_create(s_ui.start_container);
+    /* Reservierungs-Banner — amber, versteckt bis Reservierung vorhanden; steht in der Textspalte
+     * rechts neben dem QR-Code, direkt unter "NFC UID:" */
+    s_ui.reservation_banner = lv_obj_create(info_col);
     lv_obj_set_width(s_ui.reservation_banner, lv_pct(100));
     lv_obj_set_height(s_ui.reservation_banner, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_color(s_ui.reservation_banner, lv_color_hex(0x78350F), 0);
     lv_obj_set_style_border_color(s_ui.reservation_banner, lv_color_hex(0xFBBF24), 0);
     lv_obj_set_style_border_width(s_ui.reservation_banner, 1, 0);
     lv_obj_set_style_radius(s_ui.reservation_banner, 10, 0);
-    lv_obj_set_style_pad_all(s_ui.reservation_banner, 8, 0);
+    lv_obj_set_style_pad_all(s_ui.reservation_banner, 6, 0);
+    lv_obj_set_scrollbar_mode(s_ui.reservation_banner, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(s_ui.reservation_banner, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_ui.reservation_banner, LV_OBJ_FLAG_HIDDEN);
     s_ui.reservation_label = lv_label_create(s_ui.reservation_banner);
     lv_label_set_text(s_ui.reservation_label, "");
     lv_label_set_long_mode(s_ui.reservation_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(s_ui.reservation_label, lv_pct(100));
+    lv_obj_set_style_text_font(s_ui.reservation_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_ui.reservation_label, lv_color_hex(0xFDE68A), 0);
 
-    s_ui.login_btn = create_primary_button(s_ui.start_container, "HSD Login");
+    s_ui.login_btn = create_primary_button(s_ui.start_container, "Authentifizieren");
     lv_obj_add_event_cb(s_ui.login_btn, login_open_event_cb, LV_EVENT_CLICKED, NULL);
 
     /* Revoke button — same position, hidden by default, replaces login btn when unlocked */
@@ -4240,6 +5085,9 @@ static void create_ui(void)
     s_ui.result_text_label = lv_label_create(s_ui.result_container);
     lv_label_set_text(s_ui.result_text_label, "Freigeschaltet");
     lv_obj_set_style_text_font(s_ui.result_text_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_width(s_ui.result_text_label, lv_pct(100));
+    lv_label_set_long_mode(s_ui.result_text_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(s_ui.result_text_label, LV_TEXT_ALIGN_CENTER, 0);
 
     lv_obj_t *result_back_btn = create_primary_button(s_ui.result_container, "Zurück");
     lv_obj_set_style_bg_color(result_back_btn, lv_color_hex(0x374151), 0);
@@ -4680,6 +5528,9 @@ static void create_ui(void)
     lv_obj_set_width(s_ui.status_bridge_label, lv_pct(100));
     lv_obj_set_style_text_color(s_ui.status_bridge_label, lv_color_hex(0xCBD5E1), 0);
 
+    lv_obj_t *bridge_sync_btn = create_primary_button(s_ui.status_tab_bridge, "Konfiguration abrufen");
+    lv_obj_add_event_cb(bridge_sync_btn, bridge_sync_btn_cb, LV_EVENT_CLICKED, NULL);
+
     /* --- System sub-tab --- */
     /* --- Kalibrierung/Messung sub-tab --- */
     s_ui.status_tab_cal = lv_obj_create(tab_scroll_area);
@@ -4829,7 +5680,20 @@ static esp_err_t pn532_write_frame(const uint8_t *cmd, size_t cmd_len)
     }
     frame[idx++] = (uint8_t)(0x100u - dcs); /* DCS */
     frame[idx++] = 0x00u;                   /* Postamble */
-    return i2c_master_transmit(s_pn532_dev, frame, idx, PN532_I2C_RX_TIMEOUT_MS);
+    /* s_ads_mutex schuetzt hier den geteilten I2C-Bus vor PN532 (100kHz) und ADS1115
+     * (400kHz) gleichzeitig: bei unterschiedlichen SCL-Speeds zweier Geraete auf demselben
+     * Bus muss der i2c_master-Treiber vor jeder Transaktion die Taktrate umschalten – ohne
+     * Synchronisierung zwischen den Tasks fuehrt das zu ESP_ERR_INVALID_STATE. */
+    if (s_ads_mutex && (xSemaphoreTake(s_ads_mutex, pdMS_TO_TICKS(100)) != pdTRUE))
+    {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = i2c_master_transmit(s_pn532_dev, frame, idx, PN532_I2C_RX_TIMEOUT_MS);
+    if (s_ads_mutex)
+    {
+        xSemaphoreGive(s_ads_mutex);
+    }
+    return err;
 }
 
 /* Wartet bis PN532 Daten bereitstellt (Statusbyte bit0 = 1) */
@@ -4841,7 +5705,15 @@ static esp_err_t pn532_wait_ready(int timeout_ms)
     {
         /* Kurzer Timeout: Status-Byte ist sofort verfuegbar wenn bereit,
          * kein Clock-Stretching erwartet → schnell freigeben fuer GT911 */
-        esp_err_t err = i2c_master_receive(s_pn532_dev, &status, 1, PN532_STATUS_POLL_TIMEOUT_MS);
+        esp_err_t err = ESP_ERR_TIMEOUT;
+        if (!s_ads_mutex || (xSemaphoreTake(s_ads_mutex, pdMS_TO_TICKS(50)) == pdTRUE))
+        {
+            err = i2c_master_receive(s_pn532_dev, &status, 1, PN532_STATUS_POLL_TIMEOUT_MS);
+            if (s_ads_mutex)
+            {
+                xSemaphoreGive(s_ads_mutex);
+            }
+        }
         if ((err == ESP_OK) && (status & 0x01u))
         {
             return ESP_OK;
@@ -4863,7 +5735,15 @@ static esp_err_t pn532_read_response(uint8_t *buf, size_t buf_len, size_t *out_l
     {
         read_sz = sizeof(tmp);
     }
-    esp_err_t err = i2c_master_receive(s_pn532_dev, tmp, read_sz, PN532_I2C_RX_TIMEOUT_MS);
+    esp_err_t err = ESP_ERR_TIMEOUT;
+    if (!s_ads_mutex || (xSemaphoreTake(s_ads_mutex, pdMS_TO_TICKS(100)) == pdTRUE))
+    {
+        err = i2c_master_receive(s_pn532_dev, tmp, read_sz, PN532_I2C_RX_TIMEOUT_MS);
+        if (s_ads_mutex)
+        {
+            xSemaphoreGive(s_ads_mutex);
+        }
+    }
     if (err != ESP_OK)
     {
         return err;
@@ -4895,7 +5775,14 @@ static void pn532_wakeup(void)
 {
     uint8_t wake[16];
     memset(wake, 0x55, sizeof(wake));
-    i2c_master_transmit(s_pn532_dev, wake, sizeof(wake), PN532_I2C_RX_TIMEOUT_MS);
+    if (!s_ads_mutex || (xSemaphoreTake(s_ads_mutex, pdMS_TO_TICKS(100)) == pdTRUE))
+    {
+        i2c_master_transmit(s_pn532_dev, wake, sizeof(wake), PN532_I2C_RX_TIMEOUT_MS);
+        if (s_ads_mutex)
+        {
+            xSemaphoreGive(s_ads_mutex);
+        }
+    }
     vTaskDelay(pdMS_TO_TICKS(10));
 }
 
@@ -4916,7 +5803,14 @@ static esp_err_t pn532_sam_config(void)
         return err;
     }
     uint8_t ack[7] = {0};
-    i2c_master_receive(s_pn532_dev, ack, sizeof(ack), PN532_I2C_RX_TIMEOUT_MS);
+    if (!s_ads_mutex || (xSemaphoreTake(s_ads_mutex, pdMS_TO_TICKS(100)) == pdTRUE))
+    {
+        i2c_master_receive(s_pn532_dev, ack, sizeof(ack), PN532_I2C_RX_TIMEOUT_MS);
+        if (s_ads_mutex)
+        {
+            xSemaphoreGive(s_ads_mutex);
+        }
+    }
     err = pn532_wait_ready(PN532_CMD_TIMEOUT_MS);
     if (err != ESP_OK)
     {
@@ -4947,7 +5841,14 @@ static esp_err_t pn532_list_passive_target(uint8_t *uid_out, uint8_t *uid_len_ou
         return ESP_ERR_TIMEOUT;
     }
     uint8_t ack[7] = {0};
-    i2c_master_receive(s_pn532_dev, ack, sizeof(ack), PN532_I2C_RX_TIMEOUT_MS);
+    if (!s_ads_mutex || (xSemaphoreTake(s_ads_mutex, pdMS_TO_TICKS(100)) == pdTRUE))
+    {
+        i2c_master_receive(s_pn532_dev, ack, sizeof(ack), PN532_I2C_RX_TIMEOUT_MS);
+        if (s_ads_mutex)
+        {
+            xSemaphoreGive(s_ads_mutex);
+        }
+    }
     /* Warten auf Scan-Ergebnis (Karte gefunden oder interner Timeout) */
     err = pn532_wait_ready(PN532_SCAN_TIMEOUT_MS);
     if (err == ESP_ERR_TIMEOUT)
@@ -5042,11 +5943,18 @@ static esp_err_t pn532_recover(void)
     {
         ESP_LOGW(TAG, "PN532 deinit failed: %s", esp_err_to_name(err));
     }
-    /* Physischen I2C-Bus zuruecksetzen: loest haengende SDA/SCL (9 Dummy-Clocks) */
+    /* Physischen I2C-Bus zuruecksetzen: loest haengende SDA/SCL (9 Dummy-Clocks).
+     * Busweiter Reset ist besonders invasiv – gegen current_measure_task (ADS1115,
+     * eigener Task/Core) per s_ads_mutex absichern statt mitten in dessen Transaktion zu greifen. */
     i2c_master_bus_handle_t i2c_bus = bsp_i2c_get_handle();
     if (i2c_bus != NULL)
     {
-        esp_err_t reset_err = i2c_master_bus_reset(i2c_bus);
+        bool have_lock = (!s_ads_mutex) || (xSemaphoreTake(s_ads_mutex, pdMS_TO_TICKS(200)) == pdTRUE);
+        esp_err_t reset_err = have_lock ? i2c_master_bus_reset(i2c_bus) : ESP_ERR_TIMEOUT;
+        if (have_lock && s_ads_mutex)
+        {
+            xSemaphoreGive(s_ads_mutex);
+        }
         if (reset_err != ESP_OK)
         {
             ESP_LOGW(TAG, "I2C bus reset failed: %s", esp_err_to_name(reset_err));
@@ -5365,10 +6273,20 @@ static void nfc_task(void *arg)
     uint32_t scan_fail_streak = 0;
     ESP_LOGI(TAG, "nfc_task started on core %d", (int)xPortGetCoreID());
 
+    /* Erst-Init kann direkt nach dem Boot fehlschlagen (I2C-Bus wird zeitgleich von
+     * current_measure_task/ADS1115 sowie WLAN-Bringup stark belastet) – statt den Task
+     * dauerhaft zu beenden, mit Bus-Reset (pn532_recover) mehrfach erneut versuchen. */
     esp_err_t err = pn532_init();
+    for (int init_attempt = 0; (err != ESP_OK) && (init_attempt < 3); init_attempt++)
+    {
+        ESP_LOGW(TAG, "PN532 init failed (Versuch %d/3): %s – erneuter Versuch nach Bus-Reset",
+                 init_attempt + 1, esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(PN532_RECOVERY_DELAY_MS));
+        err = pn532_recover();
+    }
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "PN532 init failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "PN532 init endgueltig fehlgeschlagen: %s", esp_err_to_name(err));
         set_status_text("NFC Fehler", lv_color_hex(0xFCA5A5));
         vTaskDelete(NULL);
         return;
@@ -5402,7 +6320,11 @@ static void nfc_task(void *arg)
             }
         }
 
-        if (((s_current_view != APP_VIEW_START) && !s_register_card_mode) || s_auth_busy || s_pause_nfc_polling)
+        /* s_auth_busy NICHT hier prüfen: ein Heartbeat (v.a. gegen einen langsamen/nicht
+         * erreichbaren Server) kann durch Timeout+Retries mehrere Sekunden blockieren.
+         * Das PN532-Scannen soll davon unberührt weiterlaufen; enqueue_auth_request() puffert
+         * eine neu erkannte Karte einfach in der Request-Queue, bis der Worker wieder frei ist. */
+        if (((s_current_view != APP_VIEW_START) && !s_register_card_mode) || s_pause_nfc_polling)
         {
             vTaskDelay(pdMS_TO_TICKS(NFC_POLL_PAUSED_MS));
             continue;
@@ -5629,6 +6551,19 @@ void app_main(void)
             auth_cfg_save(&s_auth_cfg);
         }
     }
+    /* Device-ID deterministisch aus der MAC-Adresse ableiten (ohne Doppelpunkte, klein geschrieben) */
+    {
+        size_t di = 0;
+        for (size_t i = 0; (s_auth_cfg.mac[i] != '\0') && (di < sizeof(s_device_id) - 1); i++)
+        {
+            if (s_auth_cfg.mac[i] != ':')
+            {
+                s_device_id[di++] = (char)tolower((unsigned char)s_auth_cfg.mac[i]);
+            }
+        }
+        s_device_id[di] = '\0';
+        ESP_LOGI(TAG, "Device-ID aus MAC abgeleitet: %s", s_device_id[0] ? s_device_id : "<leer>");
+    }
 
     bsp_display_cfg_t display_cfg = {
         .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
@@ -5680,7 +6615,9 @@ void app_main(void)
     ESP_ERROR_CHECK(s_auth_req_queue != NULL ? ESP_OK : ESP_FAIL);
     ESP_ERROR_CHECK(s_auth_res_queue != NULL ? ESP_OK : ESP_FAIL);
 
-    BaseType_t auth_task_ok = xTaskCreatePinnedToCore(auth_worker_task, "auth_worker", 8192, NULL, 5, NULL, AUTH_TASK_CORE_ID);
+    /* 12288 statt 8192: eigene Buffer (payload[512]+response[1024]) plus esp_http_client/LWIP-
+     * interner Stackbedarf beim HTTPS-POST fuehrten mit 8192 zu einem Stack-Overflow. */
+    BaseType_t auth_task_ok = xTaskCreatePinnedToCore(auth_worker_task, "auth_worker", 12288, NULL, 5, NULL, AUTH_TASK_CORE_ID);
     if (auth_task_ok != pdPASS)
     {
         ESP_LOGE(TAG, "Auth worker start failed");

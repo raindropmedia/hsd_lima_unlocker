@@ -17,6 +17,10 @@ CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 
 CONFIG_FREERTOS_HZ=1000
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+# app_main() initialisiert Display/BSP und baut synchron den kompletten LVGL-Widget-Baum
+# (create_ui()) auf der Main-Task auf – der ESP-IDF-Default (3584 B) reicht dafuer nicht
+# und fuehrt zu einem Stack-Overflow-Panic waehrend des Boots.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_ESP_TLS_INSECURE=y
 CONFIG_LV_USE_CLIB_MALLOC=y
 CONFIG_LV_USE_CLIB_STRING=y
