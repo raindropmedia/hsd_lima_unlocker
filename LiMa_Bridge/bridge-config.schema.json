@@ -1,0 +1,319 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lima.hsd.pub/schemas/bridge-config.schema.json",
+  "title": "LiMa Bridge Configuration",
+  "description": "Die Bridge-Konfigurationsdaten ",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "machine_name": {
+      "type": "string",
+      "maxLength": 63,
+      "description": "Anzeigename der Maschine. Firmware-Buffer: char[64]."
+    },
+    "location": {
+      "type": "string",
+      "maxLength": 63,
+      "description": "Standort der Maschine. Firmware-Buffer: char[64]."
+    },
+    "info_url": {
+      "type": "string",
+      "maxLength": 127,
+      "format": "uri",
+      "description": "URL, die als QR-Code auf der Startseite angezeigt wird. Firmware-Buffer: char[128]."
+    },
+    "idle_current": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Zuletzt gemessener/konfigurierter Idle-Strom [A] am Maschinenausgang."
+    },
+    "sound_enabled": {
+      "type": "boolean",
+      "description": "Akustisches Feedback (Buzzer) aktiviert."
+    },
+    "idle_detection_enabled": {
+      "type": "boolean",
+      "description": "Idle-basiertes automatisches Abschalten nach Timer-Ablauf aktiviert."
+    },
+    "otp_required": {
+      "type": "boolean",
+      "default": true,
+      "description": "Zweiter Faktor (OTP) nach erfolgreichem Login erforderlich."
+    },
+    "unlock_duration": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1440,
+      "default": 30,
+      "description": "Freischaltdauer in Minuten (serverseitig auf 1-1440 begrenzt). Firmware-Feld: unlock_duration_min."
+    },
+    "idle_shutdown_delay_s": {
+      "type": "integer",
+      "minimum": 10,
+      "maximum": 3600,
+      "default": 60,
+      "description": "Wartezeit [s] nach Timer-Ablauf, bis das Relais bei anhaltendem Idle-Strom abschaltet (serverseitig auf 10-3600 begrenzt)."
+    },
+    "config_version": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256-Hash (hex, klein geschrieben) über den Inhalt dieses Config-Objekts, statt einer hochzählenden ID. Identischer Inhalt ergibt deterministisch denselben Hash, auch nach einem Server-Neuaufbau ohne fortlaufenden Zähler. Wird sowohl beim Herunterreichen (Server → Bridge) als auch beim Hochladen (Bridge → Server, siehe $defs.heartbeatRequestWithManifest) mitgeführt."
+    },
+    "auto_ota": {
+      "type": "boolean",
+      "default": false,
+      "description": "Automatische OTA-Updates ohne Nutzerinteraktion aktiviert."
+    },
+    "fw_version": {
+      "type": "string",
+      "maxLength": 32,
+      "pattern": "^\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.-]+)?$",
+      "description": "Aktuell auf dem Gerät laufende Firmware-Version (APP_VERSION / PROJECT_VER, z. B. \"1.0.7\"). Wird von der Bridge selbst in Setup-/Heartbeat-Requests gemeldet und serverseitig in bridge_config.fw_version gespeichert (server.py, auf 32 Zeichen begrenzt) – rein informativ, die Firmware liest dieses Feld nicht aus der Config-Antwort zurück."
+    },
+    "superuser": {
+      "type": "array",
+      "maxItems": 64,
+      "description": "Mitarbeiterkarten für Offline-Freischaltung bzw. Wartungsmodus. Wird online mit den aktivierten Scopes an /activations gesendet.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "card": {
+            "type": "string",
+            "pattern": "^[0-9A-Fa-f]{0,16}$",
+            "description": "Mitarbeiter HSD Karten-ID (reiner Hex-String ohne Trennzeichen), case-insensitive verglichen."
+          },
+          "login": { "type": "boolean", "description": "Scope login." },
+          "booking": { "type": "boolean", "description": "Scope booking." },
+          "instructions": { "type": "boolean", "description": "Scope instructions." }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "heartbeatRequest": {
+      "type": "object",
+      "description": "Normaler, schlanker Heartbeat-Request (Bridge → Server, POST /api/hsd/heartbeat). Enthält niemals das volle Manifest, sondern nur Status/Telemetrie plus den aktuell bekannten config_version-Hash – damit der Server per Hash-Vergleich erkennen kann, ob er eine geänderte Config zurückschicken muss (siehe $defs.heartbeatResponse.config) oder ob er selbst gar keine Config für diese Bridge hat (siehe $defs.heartbeatResponse.manifest_request).",
+      "additionalProperties": false,
+      "required": [
+        "device_id",
+        "mac",
+        "fw_version",
+        "config_version",
+        "unlock_status",
+        "unlock_remaining_min",
+        "idle_current_mV",
+        "current_rms_a",
+        "ads0",
+        "ads1",
+        "ads2",
+        "ads3",
+        "pcf_input"
+      ],
+      "properties": {
+        "device_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{12}$",
+          "description": "Aus der MAC-Adresse abgeleitete Geräte-ID (Kleinbuchstaben, ohne \":\", siehe app_main() in main.c)."
+        },
+        "mac": {
+          "type": "string",
+          "pattern": "^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$",
+          "description": "MAC-Adresse der Bridge (get_device_mac_text(), Format XX:XX:XX:XX:XX:XX)."
+        },
+        "fw_version": {
+          "$ref": "#/properties/fw_version",
+          "description": "Aktuell auf dem Gerät laufende Firmware-Version (APP_VERSION)."
+        },
+        "config_version": {
+          "$ref": "#/properties/config_version",
+          "description": "SHA-256-Hash der zuletzt bekannten/übernommenen Config. Wird bei JEDEM Heartbeat mitgeschickt (nicht nur beim einmaligen größeren Upload-Heartbeat), damit der Server per Vergleich entscheiden kann, ob sich etwas geändert hat oder ob er selbst noch keine Config für diese Bridge kennt."
+        },
+        "unlock_status": {
+          "type": "string",
+          "enum": [
+            "locked",
+            "unlocked"
+          ],
+          "description": "Aktueller Freischaltstatus der Maschine."
+        },
+        "unlock_remaining_min": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Verbleibende Freischaltzeit in Minuten (0 wenn gesperrt)."
+        },
+        "idle_current_mV": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Zuletzt per GUI gemessener Idle-Strom-Ruhewert [mV] (s_idle_current_measured_mV), 0 wenn noch nicht gemessen."
+        },
+        "current_rms_a": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Kontinuierlich gemessener RMS-Strom am Maschinenausgang [A] (s_current_rms_a)."
+        },
+        "ads0": {
+          "type": "integer",
+          "minimum": -32768,
+          "maximum": 32767,
+          "description": "Roh-ADC-Wert ADS1115 Kanal 0 (Stromsensor)."
+        },
+        "ads1": {
+          "type": "integer",
+          "minimum": -32768,
+          "maximum": 32767,
+          "description": "Roh-ADC-Wert ADS1115 Kanal 1 (unbenutzt)."
+        },
+        "ads2": {
+          "type": "integer",
+          "minimum": -32768,
+          "maximum": 32767,
+          "description": "Roh-ADC-Wert ADS1115 Kanal 2 (unbenutzt)."
+        },
+        "ads3": {
+          "type": "integer",
+          "minimum": -32768,
+          "maximum": 32767,
+          "description": "Roh-ADC-Wert ADS1115 Kanal 3 (unbenutzt)."
+        },
+        "pcf_input": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "description": "Zuletzt gelesenes PCF8574T-Portbyte (P4-P7 Eingänge, P0-P3 Ausgangsecho)."
+        }
+      }
+    },
+    "heartbeatRequestWithManifest": {
+      "type": "object",
+      "description": "Einmaliger, größerer Heartbeat-Request (Bridge → Server), den die Bridge SOFORT (nicht erst beim nächsten periodischen Intervall) sendet, direkt nachdem eine Heartbeat-Antwort mit manifest_request:true empfangen wurde (siehe $defs.heartbeatResponse). Enthält dieselben Felder wie ein normaler Heartbeat, zusätzlich aber das vollständige, lokal in NVS gespeicherte Manifest/Config-Objekt – damit der Server (z. B. nach eigenem Neustart/Datenverlust oder für eine ihm noch unbekannte Bridge) seinen Datenbestand aus der Bridge heraus aufbauen kann.",
+      "additionalProperties": false,
+      "required": [
+        "device_id",
+        "mac",
+        "fw_version",
+        "config_version",
+        "unlock_status",
+        "unlock_remaining_min",
+        "idle_current_mV",
+        "current_rms_a",
+        "ads0",
+        "ads1",
+        "ads2",
+        "ads3",
+        "pcf_input",
+        "manifest"
+      ],
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/heartbeatRequest/properties/device_id"
+        },
+        "mac": {
+          "$ref": "#/$defs/heartbeatRequest/properties/mac"
+        },
+        "fw_version": {
+          "$ref": "#/$defs/heartbeatRequest/properties/fw_version"
+        },
+        "config_version": {
+          "$ref": "#/$defs/heartbeatRequest/properties/config_version"
+        },
+        "unlock_status": {
+          "$ref": "#/$defs/heartbeatRequest/properties/unlock_status"
+        },
+        "unlock_remaining_min": {
+          "$ref": "#/$defs/heartbeatRequest/properties/unlock_remaining_min"
+        },
+        "idle_current_mV": {
+          "$ref": "#/$defs/heartbeatRequest/properties/idle_current_mV"
+        },
+        "current_rms_a": {
+          "$ref": "#/$defs/heartbeatRequest/properties/current_rms_a"
+        },
+        "ads0": {
+          "$ref": "#/$defs/heartbeatRequest/properties/ads0"
+        },
+        "ads1": {
+          "$ref": "#/$defs/heartbeatRequest/properties/ads1"
+        },
+        "ads2": {
+          "$ref": "#/$defs/heartbeatRequest/properties/ads2"
+        },
+        "ads3": {
+          "$ref": "#/$defs/heartbeatRequest/properties/ads3"
+        },
+        "pcf_input": {
+          "$ref": "#/$defs/heartbeatRequest/properties/pcf_input"
+        },
+        "manifest": {
+          "$ref": "#",
+          "description": "Vollständiges Bridge-Config-Objekt aus dem lokalen NVS-Speicher der Bridge (siehe Schema-Root), inkl. dessen eigenem config_version-Hash (identisch zum config_version-Feld auf dieser Ebene)."
+        }
+      }
+    },
+    "heartbeatResponse": {
+      "type": "object",
+      "description": "Antwort von POST /api/hsd/heartbeat – die Heartbeat-Daten, die die Bridge periodisch vom Server erwartet (auth_result_timer_cb() in main.c, Zweig AUTH_SRC_HEARTBEAT). Envelope, nicht Teil des eigentlichen Config-Schemas.",
+      "required": [
+        "valid"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "valid": {
+          "type": "boolean",
+          "description": "Muss true sein, sonst wertet response_is_true() die Antwort als abgelehnt und die Bridge verwirft sie komplett (kein Config-/Reservierungs-Update)."
+        },
+        "config_version": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256-Hash (hex) über die aktuelle, server-seitig für diese Bridge hinterlegte Config. Fehlt nur, wenn der Server noch GAR KEINE Config für diese Bridge kennt (siehe manifest_request) – in jedem anderen Fall immer enthalten, unabhängig davon, ob \"config\" mitgesendet wird. Es gibt kein separates config_changed-Flag: Die Bridge erkennt eine geänderte Config selbst, indem sie diesen Hash mit ihrem eigenen vergleicht, und schickt ihren eigenen Hash bei jedem Heartbeat mit (siehe $defs.heartbeatRequest)."
+        },
+        "manifest_request": {
+          "type": "boolean",
+          "const": true,
+          "description": "Wird vom Server gesetzt, wenn er (z. B. nach eigenem Neustart/Datenverlust oder für eine ihm noch unbekannte Bridge) noch keine Config/Manifest für diese Bridge gespeichert hat und deshalb keinen config_version-Hash zum Vergleich anbieten kann. Die Bridge muss darauf sofort (nicht erst beim nächsten periodischen Intervall) mit einem einmaligen größeren Heartbeat reagieren, der ihr lokal in NVS gespeichertes Manifest enthält (siehe $defs.heartbeatRequestWithManifest)."
+        },
+        "config": {
+          "$ref": "#",
+          "description": "Vollständiges Bridge-Config-Objekt (siehe Schema-Root), inkl. dessen eigenem config_version-Hash (identisch zum config_version-Feld auf dieser Ebene). Server → Bridge: wird nur mitgesendet, wenn eine admin-seitige Änderung vorliegt (server-seitiger Hash weicht vom zuletzt per Heartbeat gemeldeten Hash der Bridge ab) und der Server selbst bereits eine Config für diese Bridge hat – nicht zu verwechseln mit manifest_request, das die umgekehrte Richtung (Bridge → Server) auslöst."
+        },
+        "res_name": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Name der nächsten Reservierung. Fehlt dieses Feld komplett, löscht die Bridge eine ggf. zuvor angezeigte Reservierung (Banner auf der Startseite). Firmware-Buffer: char[65]."
+        },
+        "res_start": {
+          "type": "string",
+          "maxLength": 16,
+          "description": "Startzeit der nächsten Reservierung (Format \"YYYY-MM-DD HH:MM\", von der Firmware als Roh-String verglichen/angezeigt). Firmware-Buffer: char[17]. Nur sinnvoll zusammen mit res_name."
+        },
+        "res_end": {
+          "type": "string",
+          "maxLength": 16,
+          "description": "Endzeit der nächsten Reservierung (Format \"YYYY-MM-DD HH:MM\"); die Bridge blendet das Reservierungsbanner aus, sobald die lokale Uhrzeit diesen Wert überschreitet. Firmware-Buffer: char[17]. Nur sinnvoll zusammen mit res_name."
+        }
+      },
+      "if": {
+        "properties": {
+          "valid": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "oneOf": [
+          {
+            "required": [
+              "valid",
+              "manifest_request"
+            ]
+          },
+          {
+            "required": [
+              "valid",
+              "config_version"
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

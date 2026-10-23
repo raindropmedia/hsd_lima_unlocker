@@ -18,6 +18,7 @@
  *   - Akustisches Feedback über Buzzer (IO-Expander)
  *   - Bridge-Konfiguration wird vom Server verwaltet und per Heartbeat synchronisiert
  */
+#include <stdarg.h>
 #include <stdbool.h>
 #include <ctype.h>
 #include <stdint.h>
@@ -92,11 +93,13 @@ LV_IMG_DECLARE(hsd_logo);
 #define PWRKEY_GPIO GPIO_NUM_16
 
 #define BRIDGE_CFG_NAMESPACE "bridge_cfg"
-#define BRIDGE_CFG_VERSION 8           /* v8: resource_id (Anny-Ressourcen-ID) ergaenzt; v7: config_version als SHA-256-Hash-String */
+#define BRIDGE_CFG_VERSION 11          /* v10: superuser als Array von Objekten (card + Scopes); v9: einzelnes superuser-Objekt; v8: resource_id (Anny-Ressourcen-ID) ergaenzt; v7: config_version als SHA-256-Hash-String */
 #define ZERO_CAL_NVS_KEY "zero_cal_mv" /* Separater NVS-Key – versionierungsunabhaengig */
-#define SUPERUSER_MAX 64               /* Maximale Anzahl SuperUser-UIDs pro Bridge */
-#define SUPERUSER_UID_LEN 16           /* Max. Hex-Zeichen einer NFC-UID ohne Trennzeichen */
-#define BRIDGE_CFG_HASH_HEX_LEN 64     /* SHA-256-Hex-Digest-Laenge (ohne Nullterminator) */
+#define SUPERUSER_MAX 64               /* Maximale Anzahl SuperUser-Einträge pro Bridge */
+#define SUPERUSER_STAFF_DUMMY "larsarne.emmerich@hs-duesseldorf.de" /* Platzhalter für das Pflichtfeld staff */
+#define AUTH_RESPONSE_SIZE 8192
+#define SUPERUSER_UID_LEN 16       /* Max. Hex-Zeichen einer NFC-UID ohne Trennzeichen */
+#define BRIDGE_CFG_HASH_HEX_LEN 64 /* SHA-256-Hex-Digest-Laenge (ohne Nullterminator) */
 #define HEARTBEAT_INTERVAL_MS (5 * 60 * 1000)
 #define HEARTBEAT_INTERVAL_UNCONFIGURED_MS (1 * 60 * 1000)
 
@@ -122,7 +125,6 @@ LV_IMG_DECLARE(hsd_logo);
 
 #define AUTH_REQ_QUEUE_LEN 4
 #define AUTH_RES_QUEUE_LEN 4
-#define AUTH_BUSY_TIMEOUT_MS 12000
 #define SETUP_RETRY_INTERVAL_MS 15000
 #if ENABLE_NFC
 #define NFC_POLL_IDLE_MS 1000
@@ -199,12 +201,13 @@ typedef enum
 /* Auth-Quellen: bestimmt, welcher Server-Endpunkt angesprochen wird */
 typedef enum
 {
-    AUTH_SRC_SETUP = 0,     /* Erstregistrierung des Geräts (MAC → Token) */
-    AUTH_SRC_HEARTBEAT,     /* Periodischer Statusbericht an Server */
-    AUTH_SRC_NFC,           /* NFC-Karten-Authentifizierung */
-    AUTH_SRC_LOGIN,         /* E-Mail/Passwort-Login über GUI */
-    AUTH_SRC_PIN,           /* OTP/PIN-Eingabe (zweiter Faktor) */
-    AUTH_SRC_REGISTER_CARD, /* NFC-Karte mit Benutzer verknüpfen */
+    AUTH_SRC_SETUP = 0,       /* Erstregistrierung des Geräts (MAC → Token) */
+    AUTH_SRC_HEARTBEAT,       /* Periodischer Statusbericht an Server */
+    AUTH_SRC_NFC,             /* NFC-Karten-Authentifizierung */
+    AUTH_SRC_ACTIVATION_POLL, /* Long-Poll auf Freigabe einer Aktivierung */
+    AUTH_SRC_LOGIN,           /* E-Mail/Passwort-Login über GUI */
+    AUTH_SRC_PIN,             /* OTP/PIN-Eingabe (zweiter Faktor) */
+    AUTH_SRC_REGISTER_CARD,   /* NFC-Karte mit Benutzer verknüpfen */
 } auth_source_t;
 
 /* Auth-Request: wird in die Request-Queue eingereiht (value_a/b je nach Quelle) */
@@ -222,6 +225,8 @@ typedef struct
     bool pin_required;
     int http_status;
     uint32_t unlock_duration_min;
+    int64_t remaining_ms;
+    char message[128];
     char token[96];
 } auth_result_t;
 
@@ -231,6 +236,15 @@ typedef struct
     char token[96];
     char mac[18];
 } auth_store_t;
+
+/* Mitarbeiterkarte mit den Scopes, die beim Auflegen an /activations gesendet werden */
+typedef struct
+{
+    char card[SUPERUSER_UID_LEN + 1]; /* Mitarbeiter-HSD-Karten-ID (reiner Hex-String, keine ':') */
+    uint8_t login;
+    uint8_t booking;
+    uint8_t instructions;
+} superuser_entry_t;
 
 typedef struct
 {
@@ -245,11 +259,11 @@ typedef struct
     uint8_t otp_required;
     uint8_t auto_ota; /* 1 = automatisch updaten wenn neue Version verfuegbar */
     uint32_t unlock_duration_min;
-    char config_version[BRIDGE_CFG_HASH_HEX_LEN + 1];          /* SHA-256-Hash (hex) statt hochzaehlender Versionsnummer */
-    float current_zero_mv;                                     /* Kalibrierter Nullpunkt des Stromsensors [mV]; 0.0 = unkalibriert → MCS1806_OFFSET_MV */
-    uint32_t idle_shutdown_delay_s;                            /* Wartezeit [s] nach Timer-Ablauf, bis Relay bei Idle abschaltet; 0 = Default 60s */
-    char superuser_uids[SUPERUSER_MAX][SUPERUSER_UID_LEN + 1]; /* SuperUser-UIDs (reine Hex-Strings, keine ':') */
-    uint8_t superuser_count;                                   /* Anzahl gültiger Einträge in superuser_uids */
+    char config_version[BRIDGE_CFG_HASH_HEX_LEN + 1]; /* SHA-256-Hash (hex) statt hochzaehlender Versionsnummer */
+    float current_zero_mv;                            /* Kalibrierter Nullpunkt des Stromsensors [mV]; 0.0 = unkalibriert → MCS1806_OFFSET_MV */
+    uint32_t idle_shutdown_delay_s;                   /* Wartezeit [s] nach Timer-Ablauf, bis Relay bei Idle abschaltet; 0 = Default 60s */
+    superuser_entry_t superuser[SUPERUSER_MAX];       /* SuperUser-Karten mit Scopes */
+    uint8_t superuser_count;                          /* Anzahl gültiger Einträge in superuser */
 } bridge_cfg_t;
 
 /* Alle LVGL UI-Handles – zentral verwaltet für Zugriff aus Callbacks */
@@ -261,6 +275,7 @@ typedef struct
     lv_obj_t *status_label;
     lv_obj_t *nfc_uid_label;
     lv_obj_t *activation_overlay;
+    lv_obj_t *offline_frame;
     lv_obj_t *activation_qr;
     lv_obj_t *activation_url_label;
     lv_obj_t *activation_hint_label;
@@ -349,11 +364,12 @@ static bridge_cfg_t s_bridge_cfg = {
     .version = BRIDGE_CFG_VERSION,
 };
 static volatile bool s_bridge_cfg_updated = false;
+static volatile bool s_heartbeat_after_config = false;
 static volatile bool s_sntp_newly_synced = false; /* Flag: SNTP-Sync abgeschlossen → Status-Seite aktualisieren */
 static volatile bool s_sntp_ever_synced = false;  /* Bleibt true nach erstem erfolgreichen Sync */
 static volatile int64_t s_last_heartbeat_us = 0;
-static volatile int64_t s_unlock_until_us = 0;           /* Freischaltung gültig bis (Mikrosekunden, 0=gesperrt) */
-static volatile uint32_t s_unlock_duration_orig_min = 0; /* Originalwert für Timer-Reset */
+static volatile int64_t s_unlock_until_us = 0; /* Freischaltung gültig bis (Mikrosekunden, 0=gesperrt) */
+static volatile uint64_t s_unlock_duration_orig_ms = 0;
 static esp_netif_t *s_wifi_netif = NULL;
 static esp_event_handler_instance_t s_wifi_evt_instance = NULL;
 static esp_event_handler_instance_t s_ip_evt_instance = NULL;
@@ -363,8 +379,9 @@ static QueueHandle_t s_auth_req_queue = NULL;
 static QueueHandle_t s_auth_res_queue = NULL;
 static ui_handles_t s_ui = {0};
 static volatile bool s_auth_busy = false;
-static volatile int64_t s_auth_busy_since_us = 0;
 static volatile bool s_wifi_has_ip = false;
+static volatile bool s_server_offline = false;           /* true, wenn der letzte Heartbeat per Timeout/Verbindungsfehler scheiterte */
+static char s_last_error[80] = "";                       /* Letzter größerer Fehler der Bridge, leer = keiner seit Start */
 static volatile bool s_wifi_cfg_connect_pending = false; /* Verbindungsversuch vom WiFi-Konfig-Dialog */
 static volatile bool s_wifi_scan_in_progress = false;    /* Scan laeuft: Reconnect-Loop pausieren */
 static volatile bool s_auto_ota_in_progress = false;     /* Auto-OTA-Task laeuft bereits */
@@ -395,6 +412,7 @@ static volatile bool s_has_next_reservation = false;
 static char s_activation_url[256] = "";
 static char s_activation_code[32] = "";
 static int64_t s_activation_expires_at_us = 0;
+static volatile bool s_activation_poll_in_progress = false;
 static lv_timer_t *s_activation_poll_timer = NULL;
 static char s_device_id[64] = ""; /* Wird in app_main() aus der MAC-Adresse abgeleitet */
 /* Nicht mehr static: wird auch aus esp_lvgl_port_touch.c (GT911-Poll-Task, Core 0)
@@ -409,7 +427,9 @@ static void set_nfc_uid_text(const char *text, lv_color_t color);
 static bool enqueue_auth_request(const auth_request_t *req);
 static bool enqueue_setup_request_if_needed(void);
 static bool enqueue_token_check_request_if_needed(void);
+static void activation_poll_timer_cb(lv_timer_t *timer);
 static void activate_unlock(uint32_t server_duration_min);
+static bool activate_unlock_for_ms(uint64_t duration_ms);
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Buzzer: Akustisches Feedback über IO-Expander (1× = Info, 2× = Erfolg, 3× = Fehler)
@@ -505,11 +525,10 @@ static esp_err_t http_capture_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-/* Auth-Busy-Flag setzen/zurücksetzen mit Zeitstempel für Timeout-Erkennung */
+/* Auth-Busy-Flag bleibt bis zur Verarbeitung des Worker-Ergebnisses gesetzt. */
 static void set_auth_busy(bool busy)
 {
     s_auth_busy = busy;
-    s_auth_busy_since_us = busy ? esp_timer_get_time() : 0;
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -579,7 +598,7 @@ static esp_err_t auth_cfg_load(auth_store_t *cfg)
  * an der eigentlichen Konfiguration nichts geändert hat. */
 static void bridge_cfg_compute_hash(const bridge_cfg_t *cfg, char out_hex[BRIDGE_CFG_HASH_HEX_LEN + 1])
 {
-    char buf[768];
+    char buf[2048];
     int len = snprintf(buf, sizeof(buf),
                        "%s|%s|%s|%s|%.3f|%u|%u|%u|%u|%u|%u",
                        cfg->machine_name, cfg->location, cfg->info_url, cfg->resource_id,
@@ -594,7 +613,9 @@ static void bridge_cfg_compute_hash(const bridge_cfg_t *cfg, char out_hex[BRIDGE
 
     for (uint8_t i = 0; (i < cfg->superuser_count) && (len < (int)sizeof(buf) - 1); i++)
     {
-        int add = snprintf(buf + len, sizeof(buf) - (size_t)len, "|%s", cfg->superuser_uids[i]);
+        const superuser_entry_t *su = &cfg->superuser[i];
+        int add = snprintf(buf + len, sizeof(buf) - (size_t)len, "|%s:%u%u%u", su->card,
+                           (unsigned)su->login, (unsigned)su->booking, (unsigned)su->instructions);
         if (add > 0)
         {
             len += add;
@@ -1403,6 +1424,7 @@ static void clear_activation_state(void)
     s_activation_url[0] = '\0';
     s_activation_code[0] = '\0';
     s_activation_expires_at_us = 0;
+    s_activation_poll_in_progress = false;
     if (s_activation_poll_timer != NULL)
     {
         lv_timer_del(s_activation_poll_timer);
@@ -1654,67 +1676,112 @@ static bool extract_json_string(const char *resp, const char *key, char *out, si
     return written > 0;
 }
 
-/* JSON-Array von Strings parsen: "key":["VAL1","VAL2",...]
- * Schreibt bis zu max_items Strings der max. Länge item_size-1 in out[].
- * Gibt Anzahl geparster Einträge zurück. */
-static int extract_json_string_array(const char *resp, const char *key,
-                                     char out[][SUPERUSER_UID_LEN + 1], int max_items)
+/* Bool-Feld tolerant lesen: true, "true", 1 oder "1". */
+static bool json_flag_enabled(const char *json, const char *key)
 {
-    if (!resp || !key || !out || max_items <= 0)
+    char needle[40] = {0};
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *p = strstr(json, needle);
+    if (p == NULL)
     {
-        return 0;
+        return false;
+    }
+    p = strchr(p + strlen(needle), ':');
+    if (p == NULL)
+    {
+        return false;
+    }
+    p++;
+    while (*p && (isspace((unsigned char)*p) || (*p == '"')))
+    {
+        p++;
+    }
+    return (strncmp(p, "true", 4) == 0) || (*p == '1');
+}
+
+/* Cursor auf das erste Element des JSON-Arrays "key":[...] setzen. Gibt NULL zurück, wenn
+ * der Schlüssel fehlt oder kein Array ist. */
+static const char *json_array_begin(const char *resp, const char *key)
+{
+    if (!resp || !key)
+    {
+        return NULL;
     }
     char needle[48] = {0};
     snprintf(needle, sizeof(needle), "\"%s\"", key);
     const char *p = strstr(resp, needle);
     if (!p)
     {
-        return 0;
+        return NULL;
     }
-    p = strchr(p + strlen(needle), '[');
-    if (!p)
+    p += strlen(needle);
+    while (*p && (isspace((unsigned char)*p) || (*p == ':')))
     {
-        return 0;
+        p++;
     }
-    p++; /* skip '[' */
-    int count = 0;
-    while (count < max_items)
+    return (*p == '[') ? p + 1 : NULL;
+}
+
+/* Nächstes Objekt {...} eines Arrays als Teilstring nach out kopieren und *cursor dahinter
+ * setzen. Klammern innerhalb von Strings werden übersprungen. Gibt false am Array-Ende, bei
+ * Syntaxfehlern oder wenn das Objekt nicht in out passt zurück. */
+static bool json_array_next_object(const char **cursor, char *out, size_t out_size)
+{
+    if (!cursor || !*cursor || !out || out_size == 0)
     {
-        while (*p && isspace((unsigned char)*p))
+        return false;
+    }
+    out[0] = '\0';
+
+    const char *p = *cursor;
+    while (*p && (isspace((unsigned char)*p) || (*p == ',')))
+    {
+        p++;
+    }
+    if (*p != '{')
+    {
+        return false;
+    }
+
+    const char *start = p;
+    int depth = 0;
+    bool in_string = false;
+    for (; *p; p++)
+    {
+        if (in_string)
         {
-            p++;
-        }
-        if (*p == ']' || *p == '\0')
-        {
-            break;
-        }
-        if (*p != '"')
-        {
-            p++;
+            if (*p == '\\' && p[1])
+            {
+                p++;
+            }
+            else if (*p == '"')
+            {
+                in_string = false;
+            }
             continue;
         }
-        p++; /* skip opening '"' */
-        const char *end = strchr(p, '"');
-        if (!end)
+        if (*p == '"')
         {
-            break;
+            in_string = true;
         }
-        size_t len = (size_t)(end - p);
-        if (len >= SUPERUSER_UID_LEN + 1)
+        else if (*p == '{')
         {
-            len = SUPERUSER_UID_LEN;
+            depth++;
         }
-        memcpy(out[count], p, len);
-        out[count][len] = '\0';
-        count++;
-        p = end + 1; /* skip closing '"' */
-        /* skip optional comma */
-        while (*p && (*p == ',' || isspace((unsigned char)*p)))
+        else if (*p == '}' && (--depth == 0))
         {
-            p++;
+            size_t len = (size_t)(p - start) + 1;
+            if (len >= out_size)
+            {
+                return false;
+            }
+            memcpy(out, start, len);
+            out[len] = '\0';
+            *cursor = p + 1;
+            return true;
         }
     }
-    return count;
+    return false;
 }
 
 /* Boolean-Wert aus JSON-Antwort extrahieren (true/false) */
@@ -1931,6 +1998,59 @@ static void update_reservation_display_locked(void)
     }
 }
 
+/* Liefert eine Kopie des SuperUser-Eintrags zur Karte uid (ohne ':'), (auch bei leerem Scope =
+ * sofortige Freischaltung). Kopie, da die Konfiguration vom Auth-Worker überschrieben werden kann. */
+static bool bridge_find_superuser(const char *uid, superuser_entry_t *out)
+{
+    if ((uid == NULL) || (uid[0] == '\0'))
+    {
+        return false;
+    }
+    for (uint8_t i = 0; i < s_bridge_cfg.superuser_count && i < SUPERUSER_MAX; i++)
+    {
+        const superuser_entry_t *su = &s_bridge_cfg.superuser[i];
+        if ((su->card[0] != '\0') && (strcasecmp(uid, su->card) == 0))
+        {
+            if (out != NULL)
+            {
+                *out = *su;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Loggt alle registrierten SuperUser mit ihren Scopes (Diagnose). */
+static void bridge_log_superusers(const char *ctx)
+{
+    ESP_LOGI(TAG, "[SUPERUSER] %s: %u Eintrag/Einträge", ctx, (unsigned)s_bridge_cfg.superuser_count);
+    for (uint8_t i = 0; i < s_bridge_cfg.superuser_count && i < SUPERUSER_MAX; i++)
+    {
+        const superuser_entry_t *su = &s_bridge_cfg.superuser[i];
+        ESP_LOGI(TAG, "[SUPERUSER] #%u card=%s scope=[%s%s%s]", (unsigned)(i + 1), su->card,
+                 su->login ? "login " : "", su->booking ? "booking " : "",
+                 su->instructions ? "instructions" : "");
+    }
+}
+
+/* Server gilt als offline, wenn kein WLAN besteht oder der letzte Heartbeat nicht durchkam. */
+static bool bridge_is_offline(void)
+{
+    return !s_wifi_has_ip || s_server_offline;
+}
+
+/* Letzten größeren Fehler merken (wird als "last_error" im Heartbeat gemeldet). */
+static void bridge_set_error(const char *fmt, ...)
+{
+    char buf[sizeof(s_last_error)];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    memcpy(s_last_error, buf, sizeof(buf));
+}
+
 static void parse_bridge_config_from_response(const char *resp)
 {
     if ((resp == NULL) || (resp[0] == '\0'))
@@ -1958,16 +2078,40 @@ static void parse_bridge_config_from_response(const char *resp)
     s_bridge_cfg.auto_ota = extract_json_bool(resp, "auto_ota") ? 1 : 0;
     s_bridge_cfg.idle_shutdown_delay_s = (uint32_t)extract_json_int(resp, "idle_shutdown_delay_s", 60);
 
-    /* SuperUser-UIDs parsen und in Konfiguration übernehmen */
-    char uids[SUPERUSER_MAX][SUPERUSER_UID_LEN + 1] = {{0}};
-    int n = extract_json_string_array(resp, "superuser_uids", uids, SUPERUSER_MAX);
-    s_bridge_cfg.superuser_count = (uint8_t)(n < 0 ? 0 : (n > SUPERUSER_MAX ? SUPERUSER_MAX : n));
-    for (int i = 0; i < s_bridge_cfg.superuser_count; i++)
+    /* superuser-Array (je Objekt: card + Scope-Checkboxen) parsen; fehlt es, wird die Liste geleert */
+    superuser_entry_t entries[SUPERUSER_MAX] = {0};
+    uint8_t entry_count = 0;
+    const char *cursor = json_array_begin(resp, "superuser");
+    char su_json[160];
+    while ((cursor != NULL) && (entry_count < SUPERUSER_MAX) &&
+           json_array_next_object(&cursor, su_json, sizeof(su_json)))
     {
-        strncpy(s_bridge_cfg.superuser_uids[i], uids[i], SUPERUSER_UID_LEN);
-        s_bridge_cfg.superuser_uids[i][SUPERUSER_UID_LEN] = '\0';
+        char raw_card[SUPERUSER_UID_LEN + 8] = {0};
+        superuser_entry_t *entry = &entries[entry_count];
+        size_t j = 0;
+
+        extract_json_string(su_json, "card", raw_card, sizeof(raw_card));
+        for (size_t i = 0; (raw_card[i] != '\0') && (j < SUPERUSER_UID_LEN); i++)
+        {
+            if (raw_card[i] != ':')
+            {
+                entry->card[j++] = (char)toupper((unsigned char)raw_card[i]);
+            }
+        }
+        entry->card[j] = '\0';
+        if (entry->card[0] == '\0')
+        {
+            continue;
+        }
+        entry->login = json_flag_enabled(su_json, "login") ? 1 : 0;
+        entry->booking = json_flag_enabled(su_json, "booking") ? 1 : 0;
+        entry->instructions = json_flag_enabled(su_json, "instructions") ? 1 : 0;
+        entry_count++;
     }
-    ESP_LOGI(TAG, "SuperUser-UIDs: %d eingetragen", s_bridge_cfg.superuser_count);
+    s_bridge_cfg.superuser_count = 0;
+    memcpy(s_bridge_cfg.superuser, entries, sizeof(entries));
+    s_bridge_cfg.superuser_count = entry_count;
+    bridge_log_superusers("Konfiguration empfangen");
 
     /* Server-seitiger idle_current ueberschreibt auch den lokalen Messwert,
      * damit der Admin-Wert persistent als naechste Heartbeat-Payload genutzt wird. */
@@ -1981,6 +2125,7 @@ static void parse_bridge_config_from_response(const char *resp)
     bridge_cfg_compute_hash(&s_bridge_cfg, s_bridge_cfg.config_version);
 
     s_bridge_cfg_updated = true;
+    s_heartbeat_after_config = true;
     ESP_LOGI(TAG, "Bridge config parsed: name=%s loc=%s url=%s idle=%.2f sound=%d idle_det=%d ver=%s",
              s_bridge_cfg.machine_name, s_bridge_cfg.location, s_bridge_cfg.info_url,
              s_bridge_cfg.idle_current, s_bridge_cfg.sound_enabled,
@@ -1998,7 +2143,7 @@ static bool http_url_uses_ssl(const char *url)
 }
 
 /* HTTPS GET mit JSON-Antwort; liest Response und optionalen Bearer-Token-Header */
-static bool https_get_json(const char *url, int *http_status, bool *ok, char *response_out, size_t response_out_size)
+static bool https_get_json(const char *url, int timeout_ms, int *http_status, bool *ok, char *response_out, size_t response_out_size)
 {
     char response[1024] = {0};
     http_capture_t capture = {
@@ -2024,7 +2169,7 @@ static bool https_get_json(const char *url, int *http_status, bool *ok, char *re
         .url = url,
         .method = HTTP_METHOD_GET,
         .transport_type = use_ssl ? HTTP_TRANSPORT_OVER_SSL : HTTP_TRANSPORT_OVER_TCP,
-        .timeout_ms = 8000,
+        .timeout_ms = timeout_ms,
         .event_handler = http_capture_event_handler,
         .user_data = &capture,
     };
@@ -2086,7 +2231,8 @@ static bool https_get_json(const char *url, int *http_status, bool *ok, char *re
 /* HTTPS POST mit JSON-Payload an LiMa Server; liest Response + Token-Header */
 static esp_err_t https_post_json(const char *url, const char *payload, int *http_status, bool *ok, char *response_out, size_t response_out_size, char *token_out, size_t token_out_size)
 {
-    char response[1024] = {0};
+    static char response[AUTH_RESPONSE_SIZE]; /* nur vom Auth-Worker genutzt; Config kann bis zu 64 SuperUser enthalten */
+    response[0] = '\0';
     http_capture_t capture = {
         .response = response,
         .response_size = sizeof(response),
@@ -2235,35 +2381,48 @@ static void json_escape_string(const char *in, char *out, size_t out_size)
     out[pos] = '\0';
 }
 
-/* superuser_uids als JSON-Array serialisieren, z.B. ["04A1B2C3","..."] */
-static void bridge_cfg_superuser_uids_to_json(const bridge_cfg_t *cfg, char *out, size_t out_size)
+static void bridge_device_name_to_json(char *out, size_t out_size)
 {
-    size_t pos;
-    int n;
+    const char *device_name = s_bridge_cfg.machine_name[0]
+                                  ? s_bridge_cfg.machine_name
+                                  : (s_device_id[0] ? s_device_id : "unknown");
+    json_escape_string(device_name, out, out_size);
+}
 
-    if (out_size == 0)
+/* superuser als JSON-Array serialisieren, z.B.
+ * [{"card":"04A1B2C3","login":true,"booking":false,"instructions":false}] */
+static void bridge_cfg_superuser_to_json(const bridge_cfg_t *cfg, char *out, size_t out_size)
+{
+    size_t pos = 0;
+
+    if (out_size < 3)
     {
+        if (out_size > 0)
+        {
+            out[0] = '\0';
+        }
         return;
     }
-    n = snprintf(out, out_size, "[");
-    pos = (n > 0) ? (size_t)n : 0;
-    for (uint8_t i = 0; (i < cfg->superuser_count) && (pos + 1 < out_size); i++)
+    out[pos++] = '[';
+    for (uint8_t i = 0; (i < cfg->superuser_count) && (i < SUPERUSER_MAX); i++)
     {
-        n = snprintf(out + pos, out_size - pos, "%s\"%s\"", (i > 0) ? "," : "", cfg->superuser_uids[i]);
-        if (n > 0)
+        const superuser_entry_t *su = &cfg->superuser[i];
+        char esc_card[64];
+        json_escape_string(su->card, esc_card, sizeof(esc_card));
+        int n = snprintf(out + pos, out_size - pos,
+                         "%s{\"card\":\"%s\",\"login\":%s,\"booking\":%s,\"instructions\":%s}",
+                         (i > 0) ? "," : "", esc_card,
+                         su->login ? "true" : "false",
+                         su->booking ? "true" : "false",
+                         su->instructions ? "true" : "false");
+        if ((n < 0) || ((size_t)n >= out_size - pos - 1))
         {
-            pos += (size_t)n;
-            if (pos >= out_size)
-            {
-                pos = out_size - 1;
-            }
+            break;
         }
+        pos += (size_t)n;
     }
-    if (pos + 1 < out_size)
-    {
-        out[pos++] = ']';
-        out[pos] = '\0';
-    }
+    out[pos++] = ']';
+    out[pos] = '\0';
 }
 
 /* JSON-Schema-Manifest fuer LiMa_Server2: Grundlage fuer das dynamische Formular und die
@@ -2273,32 +2432,39 @@ static void bridge_cfg_superuser_uids_to_json(const bridge_cfg_t *cfg, char *out
  * properties.telemetry.properties exakt zum "telemetry"-Objekt in send_heartbeat_with_manifest()
  * und im normalen Heartbeat-Request. Statisch/fest, da unabhaengig von Laufzeitwerten – wird
  * serverseitig einmal pro Firmware-Version gespeichert (siehe POST /heartbeat/configuration). */
+
 static const char BRIDGE_MANIFEST_JSON[] =
-    "{\"properties\":{\"configuration\":{\"properties\":{"
-    "\"machine_name\":{\"type\":\"string\",\"title\":\"Maschinenname\"},"
-    "\"location\":{\"type\":\"string\",\"title\":\"Standort\"},"
-    "\"info_url\":{\"type\":\"string\",\"title\":\"Info-URL\"},"
-    "\"resource_id\":{\"type\":\"string\",\"title\":\"Anny-Ressourcen-ID\"},"
-    "\"idle_current\":{\"type\":\"number\",\"title\":\"Idle-Strom (A)\"},"
-    "\"sound_enabled\":{\"type\":\"boolean\",\"title\":\"Ton aktiviert\"},"
-    "\"idle_detection_enabled\":{\"type\":\"boolean\",\"title\":\"Idle-Erkennung aktiviert\"},"
-    "\"otp_required\":{\"type\":\"boolean\",\"title\":\"OTP erforderlich\"},"
-    "\"unlock_duration\":{\"type\":\"number\",\"title\":\"Freischaltdauer (Min)\"},"
-    "\"idle_shutdown_delay_s\":{\"type\":\"number\",\"title\":\"Idle-Abschaltverzögerung (s)\"},"
-    "\"auto_ota\":{\"type\":\"boolean\",\"title\":\"Automatische Updates\"},"
-    "\"superuser_uids\":{\"type\":\"array\",\"title\":\"SuperUser-UIDs\"}"
-    "}},\"telemetry\":{\"properties\":{"
-    "\"unlock_status\":{\"title\":\"Freischaltstatus\",\"enum\":[\"locked\",\"unlocked\",\"idle_pending\"],"
+    "{\"type\":\"object\",\"properties\":{\"configuration\":{\"type\":\"object\",\"title\":\"Konfiguration\",\"description\":\"Von der Bridge gespeicherte und serverseitig konfigurierbare Maschinen- und Freischaltoptionen.\",\"properties\":{"
+    "\"machine_name\":{\"type\":\"string\",\"title\":\"Maschinenname\",\"description\":\"Anzeigename der Maschine; wird auch als Gerätename im Heartbeat verwendet.\"},"
+    "\"location\":{\"type\":\"string\",\"title\":\"Standort\",\"description\":\"Standort- oder Raumangabe der Maschine.\"},"
+    "\"info_url\":{\"type\":\"string\",\"title\":\"Info-URL\",\"description\":\"URL, die auf der Startseite als QR-Code angezeigt wird.\"},"
+    "\"resource_id\":{\"type\":\"string\",\"title\":\"Anny-Ressourcen-ID\",\"description\":\"ID der zugehörigen Anny-Ressource für Buchungsabfragen und Freischaltungen.\"},"
+    "\"idle_current\":{\"type\":\"number\",\"title\":\"Idle-Strom (A)\",\"description\":\"Gemessener oder konfigurierter Strom im Leerlauf; Grundlage der Idle-Erkennung.\"},"
+    "\"sound_enabled\":{\"type\":\"boolean\",\"title\":\"Ton aktiviert\",\"description\":\"Aktiviert oder deaktiviert akustische Rückmeldungen der Bridge.\"},"
+    "\"idle_detection_enabled\":{\"type\":\"boolean\",\"title\":\"Idle-Erkennung aktiviert\",\"description\":\"Schaltet das automatische Abschalten nach Timer-Ablauf bei erkanntem Leerlauf ein oder aus.\"},"
+    "\"otp_required\":{\"type\":\"boolean\",\"title\":\"OTP erforderlich\",\"description\":\"Legt fest, ob nach erfolgreicher Anmeldung ein zusätzlicher OTP-Faktor erforderlich ist.\"},"
+    "\"unlock_duration\":{\"type\":\"number\",\"title\":\"Freischaltdauer (Min)\",\"description\":\"Standarddauer der Maschinenfreischaltung in Minuten, sofern keine Buchungsrestzeit vorliegt.\"},"
+    "\"idle_shutdown_delay_s\":{\"type\":\"number\",\"title\":\"Idle-Abschaltverzögerung (s)\",\"description\":\"Dauer in Sekunden, die der Strom unter der Idle-Schwelle liegen muss, bevor das Relais abschaltet.\"},"
+    "\"auto_ota\":{\"type\":\"boolean\",\"title\":\"Automatische Updates\",\"description\":\"Erlaubt der Bridge, verfügbare Firmware-Updates automatisch einzuspielen.\"},"
+    "\"superuser\":{\"type\":\"array\",\"title\":\"SuperUser\",\"description\":\"Mitarbeiterkarten, die eine Maschine mit dem gewählten Scope offline bzw. im Wartungsmodus freischalten dürfen.\",\"items\":{\"type\":\"object\",\"title\":\"SuperUser-Karte\",\"properties\":{"
+    "\"card\":{\"type\":\"string\",\"title\":\"Karten-ID\",\"description\":\"Mitarbeiter HSD Karten-ID\"},"
+    "\"login\":{\"type\":\"boolean\",\"title\":\"Scope: login\",\"description\":\"Für diese Karte ist der Login erforderlich.\"},"
+    "\"booking\":{\"type\":\"boolean\",\"title\":\"Scope: booking\",\"description\":\"Für diese Karte ist eine Buchung erforderlich.\"},"
+    "\"instructions\":{\"type\":\"boolean\",\"title\":\"Scope: instructions\",\"description\":\"Für diese Karte sind Sicherheitsunterweisungen erforderlich.\"}}}}"
+    "}},\"telemetry\":{\"type\":\"object\",\"title\":\"Telemetrie\",\"description\":\"Aktueller Freischaltstatus und Messwerte der Bridge.\",\"properties\":{"
+    "\"device_name\":{\"type\":\"string\",\"title\":\"Gerätename\",\"description\":\"Konfigurierter Maschinenname; wenn keiner gesetzt ist, wird die Geräte-ID verwendet.\"},"
+    "\"unlock_status\":{\"type\":\"string\",\"title\":\"Freischaltstatus\",\"description\":\"Aktueller Zustand der Freischaltung einschließlich einer eventuell laufenden Idle-Abschaltwartezeit.\",\"enum\":[\"locked\",\"unlocked\",\"idle_pending\"],"
     "\"x-enum-titles\":{\"locked\":\"Gesperrt\",\"unlocked\":\"Freigeschaltet\","
     "\"idle_pending\":\"Wartet auf Idle-Abschaltung\"}},"
-    "\"unlock_remaining_min\":{\"title\":\"Verbleibende Zeit (Min)\"},"
-    "\"idle_current_mV\":{\"title\":\"Idle-Strom (mV)\"},"
-    "\"current_rms_a\":{\"title\":\"Strom RMS (A)\"},"
-    "\"ads0\":{\"title\":\"ADC Kanal 0\"},"
-    "\"ads1\":{\"title\":\"ADC Kanal 1\"},"
-    "\"ads2\":{\"title\":\"ADC Kanal 2\"},"
-    "\"ads3\":{\"title\":\"ADC Kanal 3\"},"
-    "\"pcf_input\":{\"title\":\"PCF8574 Eingänge\"}"
+    "\"unlock_remaining_min\":{\"type\":\"integer\",\"title\":\"Verbleibende Zeit (Min)\",\"description\":\"Verbleibende Freischaltzeit in Minuten; bei gesperrter Maschine 0.\"},"
+    "\"idle_current_mV\":{\"type\":\"number\",\"title\":\"Idle-Strom (mV)\",\"description\":\"Zuletzt per GUI gemessener Ruhewert des Stromsensors in Millivolt.\"},"
+    "\"current_rms_a\":{\"type\":\"number\",\"title\":\"Strom RMS (A)\",\"description\":\"Kontinuierlich gemessener Effektivstrom am Maschinenausgang in Ampere.\"},"
+    "\"ads0\":{\"type\":\"integer\",\"title\":\"ADC Kanal 0\",\"description\":\"Rohmesswert des ADS1115 an Kanal 0, der für den Stromsensor verwendet wird.\"},"
+    "\"ads1\":{\"type\":\"integer\",\"title\":\"ADC Kanal 1\",\"description\":\"Rohmesswert des ADS1115 an Kanal 1 (derzeit unbenutzt).\"},"
+    "\"ads2\":{\"type\":\"integer\",\"title\":\"ADC Kanal 2\",\"description\":\"Rohmesswert des ADS1115 an Kanal 2 (derzeit unbenutzt).\"},"
+    "\"ads3\":{\"type\":\"integer\",\"title\":\"ADC Kanal 3\",\"description\":\"Rohmesswert des ADS1115 an Kanal 3 (derzeit unbenutzt).\"},"
+    "\"pcf_input\":{\"type\":\"integer\",\"title\":\"PCF8574 Eingänge\",\"description\":\"Zuletzt gelesenes Portbyte des PCF8574T; Bits P4 bis P7 bilden die digitalen Eingänge ab.\"},"
+    "\"last_error\":{\"type\":\"string\",\"title\":\"Letzter Fehler\",\"description\":\"Letzter größerer Fehler der Bridge seit dem Start (z. B. Server nicht erreichbar, OTA- oder PN532-Fehler); leer, wenn keiner aufgetreten ist.\"}"
     "}}}}";
 
 /* Freischaltstatus als Tri-State fuer Telemetrie: "locked" (Relay aus), "unlocked" (Freischalt-
@@ -2328,19 +2494,19 @@ static void bridge_cfg_to_configuration_json(const bridge_cfg_t *cfg, char *out,
     char esc_loc[128];
     char esc_url[256];
     char esc_res[48];
-    char uids_json[1600];
+    char superuser_json[SUPERUSER_MAX * 90 + 8];
 
     json_escape_string(cfg->machine_name, esc_name, sizeof(esc_name));
     json_escape_string(cfg->location, esc_loc, sizeof(esc_loc));
     json_escape_string(cfg->info_url, esc_url, sizeof(esc_url));
     json_escape_string(cfg->resource_id, esc_res, sizeof(esc_res));
-    bridge_cfg_superuser_uids_to_json(cfg, uids_json, sizeof(uids_json));
+    bridge_cfg_superuser_to_json(cfg, superuser_json, sizeof(superuser_json));
 
     snprintf(out, out_size,
              "{\"machine_name\":\"%s\",\"location\":\"%s\",\"info_url\":\"%s\",\"resource_id\":\"%s\","
              "\"idle_current\":%.3f,\"sound_enabled\":%s,\"idle_detection_enabled\":%s,"
              "\"otp_required\":%s,\"unlock_duration\":%u,\"idle_shutdown_delay_s\":%u,"
-             "\"auto_ota\":%s,\"superuser_uids\":%s}",
+             "\"auto_ota\":%s,\"superuser\":%s}",
              esc_name, esc_loc, esc_url, esc_res,
              (double)cfg->idle_current,
              cfg->sound_enabled ? "true" : "false",
@@ -2349,7 +2515,7 @@ static void bridge_cfg_to_configuration_json(const bridge_cfg_t *cfg, char *out,
              (unsigned)cfg->unlock_duration_min,
              (unsigned)cfg->idle_shutdown_delay_s,
              cfg->auto_ota ? "true" : "false",
-             uids_json);
+             superuser_json);
 }
 
 /* Sendet EINMALIG und SOFORT (nicht erst beim naechsten periodischen Intervall) den vollen
@@ -2359,12 +2525,12 @@ static void bridge_cfg_to_configuration_json(const bridge_cfg_t *cfg, char *out,
  * Auth-Worker-Task, direkt im Anschluss an den normalen Heartbeat-Request. */
 static void send_heartbeat_with_manifest(void)
 {
-    char *configuration_json = malloc(2048);
-    char *manifest_escaped = malloc(2048);
-    char *payload = malloc(4096);
+    char *configuration_json = malloc(SUPERUSER_MAX * 90 + 1024);
+    char *manifest_escaped = malloc(sizeof(BRIDGE_MANIFEST_JSON) * 2 + 1);
+    char *payload = NULL;
     char response[1024] = {0};
 
-    if ((configuration_json == NULL) || (manifest_escaped == NULL) || (payload == NULL))
+    if ((configuration_json == NULL) || (manifest_escaped == NULL))
     {
         ESP_LOGE(TAG, "[HEARTBEAT] Konfigurations-Upload: Speicher fuer Payload konnte nicht alloziert werden");
         free(configuration_json);
@@ -2373,31 +2539,32 @@ static void send_heartbeat_with_manifest(void)
         return;
     }
 
-    bridge_cfg_to_configuration_json(&s_bridge_cfg, configuration_json, 2048);
+    bridge_cfg_to_configuration_json(&s_bridge_cfg, configuration_json, SUPERUSER_MAX * 90 + 1024);
     /* Das Manifest wird laut Server-API als JSON-STRING gesendet (nicht als verschachteltes
      * Objekt) – der eigentliche JSON-Schema-Inhalt muss also selbst als String-Wert escaped
      * werden. */
-    json_escape_string(BRIDGE_MANIFEST_JSON, manifest_escaped, 2048);
+    json_escape_string(BRIDGE_MANIFEST_JSON, manifest_escaped, sizeof(BRIDGE_MANIFEST_JSON) * 2 + 1);
+    const size_t payload_size = strlen(manifest_escaped) + strlen(configuration_json) + 512;
+    payload = malloc(payload_size);
+    if (payload == NULL)
+    {
+        ESP_LOGE(TAG, "[HEARTBEAT] Konfigurations-Upload: Speicher fuer Payload konnte nicht alloziert werden");
+        free(configuration_json);
+        free(manifest_escaped);
+        return;
+    }
 
-    const bool unlocked = (s_unlock_until_us > 0) && (esp_timer_get_time() < s_unlock_until_us);
-    const uint32_t remaining_min = unlocked
-                                       ? (uint32_t)((s_unlock_until_us - esp_timer_get_time()) / 60000000ULL)
-                                       : 0U;
-    const float idle_mV = (s_idle_current_measured_mV >= 0.0f) ? s_idle_current_measured_mV : 0.0f;
+    char device_name_json[128];
+    bridge_device_name_to_json(device_name_json, sizeof(device_name_json));
 
-    snprintf(payload, 4096,
+    snprintf(payload, payload_size,
              "{\"device_id\":\"%s\",\"fw_version\":\"" APP_VERSION "\",\"config_version\":\"%s\","
-             "\"telemetry\":{\"unlock_status\":\"%s\",\"unlock_remaining_min\":%u,"
-             "\"idle_current_mV\":%.3f,\"current_rms_a\":%.6f,"
-             "\"ads0\":%d,\"ads1\":%d,\"ads2\":%d,\"ads3\":%d,\"pcf_input\":%u},"
-             "\"manifest\":\"%s\",\"configuration\":%s}",
+             "\"manifest\":\"%s\",\"configuration\":%s,\"device_name\":\"%s\"}",
              s_device_id[0] ? s_device_id : "unknown",
              s_bridge_cfg.config_version,
-             bridge_unlock_status_text(),
-             remaining_min, idle_mV, (double)s_current_rms_a,
-             s_ads_raw[0], s_ads_raw[1], s_ads_raw[2], s_ads_raw[3], (unsigned)s_pcf_input,
              manifest_escaped,
-             configuration_json);
+             configuration_json,
+             device_name_json);
 
     s_last_heartbeat_us = esp_timer_get_time();
 
@@ -2438,7 +2605,7 @@ static void fetch_next_reservation(void)
     }
 
     snprintf(url, sizeof(url), "%s%s", AUTH_URL_BOOKINGS, s_bridge_cfg.resource_id);
-    https_get_json(url, &http_status, &ok, response, sizeof(response));
+    https_get_json(url, 8000, &http_status, &ok, response, sizeof(response));
     if (!ok)
     {
         ESP_LOGW(TAG, "[BOOKINGS] Abruf fehlgeschlagen: status=%d", http_status);
@@ -2490,8 +2657,9 @@ static void auth_worker_task(void *arg)
             continue;
         }
 
-        char payload[512] = {0};
-        char response[1024] = {0}; /* 1024 Bytes: Platz für Config + Reservierungsdaten */
+        char payload[768] = {0};
+        static char response[AUTH_RESPONSE_SIZE]; /* Platz für Config (inkl. SuperUser-Array) + Reservierungsdaten */
+        response[0] = '\0';
         const char *url = AUTH_URL_ACTIVATIONS;
 
         res.source = req.source;
@@ -2499,6 +2667,8 @@ static void auth_worker_task(void *arg)
         res.pin_required = false;
         res.http_status = 0;
         res.unlock_duration_min = 0;
+        res.remaining_ms = -1;
+        res.message[0] = '\0';
         res.token[0] = '\0';
 
         {
@@ -2509,8 +2679,42 @@ static void auth_worker_task(void *arg)
             }
         }
 
+        if (req.source == AUTH_SRC_ACTIVATION_POLL)
+        {
+            char decision_url[256] = {0};
+            snprintf(decision_url, sizeof(decision_url), "%s%s", AUTH_URL_ACTIVATION_DECISION, req.value_a);
+            bool poll_ok = false;
+            bool request_ok = https_get_json(decision_url, 28000, &res.http_status, &poll_ok,
+                                             response, sizeof(response));
+            res.success = request_ok && poll_ok;
+            if (res.http_status == 200)
+            {
+                res.remaining_ms = extract_json_int64(response, "remaining_ms", -1);
+            }
+            else if (res.http_status == 403)
+            {
+                if (!extract_json_string(response, "error", res.message, sizeof(res.message)))
+                {
+                    snprintf(res.message, sizeof(res.message), "Zugriff verweigert");
+                }
+            }
+
+            if (xQueueSend(s_auth_res_queue, &res, 0) != pdTRUE)
+            {
+                ESP_LOGW(TAG, "Activation poll result queue full");
+                set_auth_busy(false);
+                s_activation_poll_in_progress = false;
+            }
+            continue;
+        }
+
         if (req.source == AUTH_SRC_HEARTBEAT)
         {
+            char device_name_json[128];
+            bridge_device_name_to_json(device_name_json, sizeof(device_name_json));
+            char last_error_json[2 * sizeof(s_last_error)];
+            json_escape_string(s_last_error, last_error_json, sizeof(last_error_json));
+
             const bool heartbeat_unlocked = (s_unlock_until_us > 0) && (esp_timer_get_time() < s_unlock_until_us);
             const uint32_t heartbeat_remaining_min = heartbeat_unlocked
                                                          ? (uint32_t)((s_unlock_until_us - esp_timer_get_time()) / 60000000ULL)
@@ -2523,7 +2727,8 @@ static void auth_worker_task(void *arg)
                      "{\"device_id\":\"%s\",\"fw_version\":\"" APP_VERSION "\",\"config_version\":\"%s\","
                      "\"telemetry\":{\"unlock_status\":\"%s\",\"unlock_remaining_min\":%u,"
                      "\"idle_current_mV\":%.3f,\"current_rms_a\":%.6f,"
-                     "\"ads0\":%d,\"ads1\":%d,\"ads2\":%d,\"ads3\":%d,\"pcf_input\":%u}}",
+                     "\"ads0\":%d,\"ads1\":%d,\"ads2\":%d,\"ads3\":%d,\"pcf_input\":%u,"
+                     "\"device_name\":\"%s\",\"last_error\":\"%s\"}}",
                      s_device_id[0] ? s_device_id : "unknown",
                      s_bridge_cfg.config_version,
                      bridge_unlock_status_text(),
@@ -2534,7 +2739,9 @@ static void auth_worker_task(void *arg)
                      s_ads_raw[1],
                      s_ads_raw[2],
                      s_ads_raw[3],
-                     (unsigned)s_pcf_input);
+                     (unsigned)s_pcf_input,
+                     device_name_json,
+                     last_error_json);
             url = AUTH_URL_HEARTBEAT;
         }
         else if (req.source == AUTH_SRC_NFC)
@@ -2543,9 +2750,38 @@ static void auth_worker_task(void *arg)
             {
                 ESP_LOGW(TAG, "[AUTH] resource_id nicht konfiguriert – Server antwortet mit 400");
             }
-            snprintf(payload, sizeof(payload),
-                     "{\"card_id\":\"%s\",\"device_id\":\"%s\",\"resource_id\":\"%s\"}",
-                     req.value_a, s_device_id[0] ? s_device_id : "unknown", s_bridge_cfg.resource_id);
+            superuser_entry_t su = {0};
+            const bool is_su = bridge_find_superuser(req.value_a, &su);
+            ESP_LOGI(TAG, "[SUPERUSER] Karte %s: %s (bekannte Einträge: %u)", req.value_a,
+                     is_su ? "SuperUser, Scope wird gesendet" : "kein SuperUser", (unsigned)s_bridge_cfg.superuser_count);
+            if (is_su)
+            {
+                /* SuperUser-Karte: Scope(s) mitsenden; ohne booking verlangt der Server duration_ms. */
+                char scope_json[64];
+                snprintf(scope_json, sizeof(scope_json), "%s%s%s%s%s",
+                         su.login ? "\"login\"" : "",
+                         (su.login && (su.booking || su.instructions)) ? "," : "",
+                         su.booking ? "\"booking\"" : "",
+                         (su.booking && su.instructions) ? "," : "",
+                         su.instructions ? "\"instructions\"" : "");
+                char duration_json[40] = "";
+                if (!su.booking)
+                {
+                    const uint32_t dur_min = (s_bridge_cfg.unlock_duration_min > 0) ? s_bridge_cfg.unlock_duration_min : 30;
+                    snprintf(duration_json, sizeof(duration_json), ",\"duration_ms\":%llu", (unsigned long long)dur_min * 60000ULL);
+                }
+                snprintf(payload, sizeof(payload),
+                         "{\"card_id\":\"%s\",\"device_id\":\"%s\",\"resource_id\":\"%s\",\"scope\":[%s],"
+                         "\"staff\":[\"" SUPERUSER_STAFF_DUMMY "\"]%s}",
+                         req.value_a, s_device_id[0] ? s_device_id : "unknown", s_bridge_cfg.resource_id,
+                         scope_json, duration_json);
+            }
+            else
+            {
+                snprintf(payload, sizeof(payload),
+                         "{\"card_id\":\"%s\",\"device_id\":\"%s\",\"resource_id\":\"%s\"}",
+                         req.value_a, s_device_id[0] ? s_device_id : "unknown", s_bridge_cfg.resource_id);
+            }
             url = AUTH_URL_ACTIVATIONS;
         }
         else if (req.source == AUTH_SRC_LOGIN)
@@ -2608,19 +2844,20 @@ static void auth_worker_task(void *arg)
             }
             if ((req.source == AUTH_SRC_HEARTBEAT) && res.success)
             {
-                /* parse_bridge_config_from_response() prueft selbst, ob ein "configuration"-
-                 * Objekt vorhanden ist (Admin hat eine Aenderung hinterlegt, wird vom Server
-                 * unabhaengig vom config_version-Hash ausgeliefert, sobald vorhanden – sonst
-                 * ein No-Op). */
-                parse_bridge_config_from_response(response);
-
                 /* Server kennt diese Bridge (device_id + fw_version) noch GAR NICHT (Neustart /
                  * neue Bridge / FW-Update) – sofort (nicht erst beim naechsten periodischen
-                 * Intervall) Manifest + aktuelle Konfiguration hochladen. */
+                 * Intervall) Manifest + aktuelle Konfiguration hochladen. Eine Bestandsanfrage
+                 * hat laut Protokoll Vorrang vor einer gleichzeitig gelieferten Wunsch-Config. */
                 if (extract_json_bool(response, "configuration_request"))
                 {
                     ESP_LOGI(TAG, "[HEARTBEAT] Server fordert Konfigurations-Upload an (configuration_request=true)");
                     send_heartbeat_with_manifest();
+                }
+                else
+                {
+                    /* parse_bridge_config_from_response() prüft selbst auf ein configuration-
+                     * Objekt und übernimmt nur die von dieser Firmware unterstützten Werte. */
+                    parse_bridge_config_from_response(response);
                 }
 
                 /* Reservierungen separat ueber GET /bookings/{Ressourcen-ID} holen */
@@ -2640,6 +2877,7 @@ static void auth_worker_task(void *arg)
                 s_activation_url[0] = '\0';
                 s_activation_code[0] = '\0';
                 s_activation_expires_at_us = 0;
+                s_activation_poll_in_progress = false;
                 ESP_LOGI(TAG, "[AUTH] activations response: status=%d ok=%d body=%s", res.http_status, (int)ok, response);
                 if (extract_json_string(response, "url", s_activation_url, sizeof(s_activation_url)))
                 {
@@ -2750,11 +2988,6 @@ static void auto_ota_task(void *arg);
 
 static void activation_poll_timer_cb(lv_timer_t *timer)
 {
-    char decision_url[256] = {0};
-    char response[1024] = {0};
-    int http_status = 0;
-    bool ok = false;
-
     LV_UNUSED(timer);
     if ((s_activation_url[0] == '\0') && (s_activation_code[0] == '\0'))
     {
@@ -2771,69 +3004,20 @@ static void activation_poll_timer_cb(lv_timer_t *timer)
 
     show_activation_url_on_display();
 
-    if (s_activation_code[0] == '\0')
+    if ((s_activation_code[0] == '\0') || s_activation_poll_in_progress ||
+        s_auth_busy || !s_wifi_has_ip)
     {
         return;
     }
 
-    snprintf(decision_url, sizeof(decision_url), "%s%s", AUTH_URL_ACTIVATION_DECISION, s_activation_code);
-    https_get_json(decision_url, &http_status, &ok, response, sizeof(response));
-
-    if (http_status == 200)
+    auth_request_t req = {
+        .source = AUTH_SRC_ACTIVATION_POLL,
+    };
+    strncpy(req.value_a, s_activation_code, sizeof(req.value_a) - 1);
+    if (enqueue_auth_request(&req))
     {
-        /* Server liefert bei Erfolg {remaining_ms, booking_id}: Restzeit der Buchung (bzw. der
-         * Wartungsfreigabe) in Millisekunden ab Antwort – keine Uhrzeit noetig. */
-        uint32_t unlock_min = (s_bridge_cfg.unlock_duration_min > 0) ? s_bridge_cfg.unlock_duration_min : 30;
-        int64_t remaining_ms = extract_json_int64(response, "remaining_ms", -1);
-        if (remaining_ms > 0)
-        {
-            int64_t remaining_min = remaining_ms / 60000;
-            if (remaining_min < 1)
-            {
-                remaining_min = 1;
-            }
-            else if (remaining_min > 1440)
-            {
-                remaining_min = 1440;
-            }
-            unlock_min = (uint32_t)remaining_min;
-            ESP_LOGI(TAG, "[ACTIVATION] remaining_ms=%lld -> Freischaltung fuer %u Min.", (long long)remaining_ms, (unsigned)unlock_min);
-        }
-        else
-        {
-            ESP_LOGW(TAG, "[ACTIVATION] Keine auswertbare remaining_ms in der Antwort, nutze konfigurierte Dauer (%u Min.)", (unsigned)unlock_min);
-        }
-        beep(2);
-        activate_unlock(unlock_min);
-        show_result_page(true, "Freigeschaltet");
-        clear_activation_state();
-        return;
-    }
-
-    if (http_status == 403)
-    {
-        char msg[128] = {0};
-        if (!extract_json_string(response, "error", msg, sizeof(msg)))
-        {
-            snprintf(msg, sizeof(msg), "Zugriff verweigert");
-        }
-        beep(3);
-        show_result_page(false, msg);
-        clear_activation_state();
-        return;
-    }
-
-    if (http_status == 404)
-    {
-        beep(3);
-        show_result_page(false, "Session abgelaufen");
-        clear_activation_state();
-        return;
-    }
-
-    if (http_status >= 500)
-    {
-        set_status_text("Serverfehler bei Freigabe", lv_color_hex(0xFCA5A5));
+        s_activation_poll_in_progress = true;
+        set_auth_busy(true);
     }
 }
 
@@ -2854,6 +3038,64 @@ static void auth_result_timer_cb(lv_timer_t *timer)
             bridge_cfg_save(&s_bridge_cfg);
             update_machine_info_ui();
             ESP_LOGI(TAG, "Bridge config saved to NVS (ver=%s)", s_bridge_cfg.config_version);
+        }
+
+        if (res.source == AUTH_SRC_ACTIVATION_POLL)
+        {
+            s_activation_poll_in_progress = false;
+            if (s_activation_code[0] == '\0')
+            {
+                continue;
+            }
+            if (res.http_status == 202)
+            {
+                continue;
+            }
+            if (res.http_status == 200)
+            {
+                if (res.remaining_ms > 0)
+                {
+                    ESP_LOGI(TAG, "[ACTIVATION] Freigabe mit Restdauer %lld ms", (long long)res.remaining_ms);
+                    if (activate_unlock_for_ms((uint64_t)res.remaining_ms))
+                    {
+                        beep(2);
+                        show_result_page(true, "Freigeschaltet");
+                    }
+                    else
+                    {
+                        beep(3);
+                        show_result_page(false, "Ungueltige Restdauer");
+                    }
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "[ACTIVATION] Freigabe ohne positive remaining_ms; Relais bleibt gesperrt");
+                    beep(3);
+                    show_result_page(false, "Freigabe ohne gueltige Restdauer");
+                }
+                clear_activation_state();
+            }
+            else if (res.http_status == 403)
+            {
+                beep(3);
+                show_result_page(false, res.message[0] ? res.message : "Zugriff verweigert");
+                clear_activation_state();
+            }
+            else if (res.http_status == 404)
+            {
+                beep(3);
+                show_result_page(false, "Session abgelaufen");
+                clear_activation_state();
+            }
+            else if (server_unreachable)
+            {
+                set_status_text("Server nicht erreichbar - versuche erneut", lv_color_hex(0xFCA5A5));
+            }
+            else
+            {
+                set_status_text("Serverfehler bei Freigabe - versuche erneut", lv_color_hex(0xFCA5A5));
+            }
+            continue;
         }
 
         if (res.source == AUTH_SRC_SETUP)
@@ -2895,6 +3137,7 @@ static void auth_result_timer_cb(lv_timer_t *timer)
 
         if (res.source == AUTH_SRC_HEARTBEAT)
         {
+            s_server_offline = server_unreachable;
             if (res.success)
             {
                 if (bridge_cfg_is_configured(&s_bridge_cfg))
@@ -2929,11 +3172,13 @@ static void auth_result_timer_cb(lv_timer_t *timer)
             else if (server_unreachable)
             {
                 ESP_LOGW(TAG, "Heartbeat: server unreachable");
+                bridge_set_error("Heartbeat: Server nicht erreichbar");
                 set_status_text("Server nicht erreichbar", lv_color_hex(0xFCA5A5));
             }
             else
             {
                 ESP_LOGW(TAG, "Heartbeat failed (http_status=%d)", res.http_status);
+                bridge_set_error("Heartbeat: HTTP %d", res.http_status);
             }
             continue;
         }
@@ -3033,6 +3278,21 @@ static void auth_result_timer_cb(lv_timer_t *timer)
         {
             beep(3);
             show_result_page(false, "Verweigert");
+        }
+    }
+
+    if (s_heartbeat_after_config && auth_has_token() && s_wifi_has_ip && !s_auth_busy)
+    {
+        auth_request_t req = {
+            .source = AUTH_SRC_HEARTBEAT,
+        };
+
+        if (enqueue_auth_request(&req))
+        {
+            s_heartbeat_after_config = false;
+            set_auth_busy(true);
+            s_last_heartbeat_us = esp_timer_get_time();
+            ESP_LOGI(TAG, "Heartbeat after configuration update enqueued");
         }
     }
 }
@@ -3451,6 +3711,7 @@ static void ota_task(void *arg)
     else
     {
         ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(err));
+        bridge_set_error("OTA fehlgeschlagen: %s", esp_err_to_name(err));
         set_ota_status_text("Update fehlgeschlagen!", lv_color_hex(0xFCA5A5));
         if (s_ui.ota_btn && bsp_display_lock(50))
         {
@@ -3700,6 +3961,7 @@ static void auto_ota_task(void *arg)
     else
     {
         ESP_LOGE(TAG, "Auto-OTA failed: %s", esp_err_to_name(ota_err));
+        bridge_set_error("Auto-OTA fehlgeschlagen: %s", esp_err_to_name(ota_err));
         set_ota_status_text("Auto-Update fehlgeschlagen!", lv_color_hex(0xFCA5A5));
         s_auto_ota_in_progress = false;
     }
@@ -4123,6 +4385,73 @@ static void status_tab_bridge_cb(lv_event_t *event)
     status_show_tab(1);
 }
 
+static void bridge_reset_cancel_cb(lv_event_t *event)
+{
+    lv_obj_t *message_box = lv_event_get_user_data(event);
+    lv_msgbox_close(message_box);
+}
+
+static void bridge_reset_confirm_cb(lv_event_t *event)
+{
+    lv_obj_t *message_box = lv_event_get_user_data(event);
+    if (s_auth_busy)
+    {
+        set_status_text("Bridge beschaeftigt - bitte spaeter erneut versuchen", lv_color_hex(0xFCA5A5));
+        lv_msgbox_close(message_box);
+        return;
+    }
+
+    bridge_cfg_t previous_config = s_bridge_cfg;
+    bridge_cfg_set_defaults(&s_bridge_cfg);
+    esp_err_t err = bridge_cfg_save(&s_bridge_cfg);
+    if (err != ESP_OK)
+    {
+        s_bridge_cfg = previous_config;
+        ESP_LOGE(TAG, "Bridge-Konfiguration konnte nicht zurueckgesetzt werden: %s", esp_err_to_name(err));
+        bridge_set_error("Config-Reset fehlgeschlagen: %s", esp_err_to_name(err));
+        if (s_ui.status_bridge_label)
+        {
+            lv_label_set_text(s_ui.status_bridge_label, "Zuruecksetzen fehlgeschlagen (NVS-Fehler)");
+            lv_obj_set_style_text_color(s_ui.status_bridge_label, lv_color_hex(0xFCA5A5), 0);
+        }
+        lv_msgbox_close(message_box);
+        return;
+    }
+
+    s_bridge_cfg_updated = false;
+    s_last_heartbeat_us = 0;
+    update_machine_info_ui();
+    status_update_info();
+    set_status_text("Bridge-Konfiguration auf Werkseinstellungen gesetzt", lv_color_hex(0x86EFAC));
+    ESP_LOGI(TAG, "Bridge-Konfiguration auf Werkseinstellungen zurueckgesetzt");
+    lv_msgbox_close(message_box);
+}
+
+static void bridge_reset_btn_cb(lv_event_t *event)
+{
+    LV_UNUSED(event);
+    if (!ui_btn_ok())
+    {
+        return;
+    }
+    if (s_auth_busy)
+    {
+        set_status_text("Bridge beschaeftigt - bitte spaeter erneut versuchen", lv_color_hex(0xFCA5A5));
+        return;
+    }
+
+    lv_obj_t *message_box = lv_msgbox_create(NULL);
+    lv_msgbox_add_title(message_box, "Bridge-Konfiguration zuruecksetzen?");
+    lv_msgbox_add_text(message_box,
+                       "Maschinenname, Standort, URL und weitere Bridge-Einstellungen werden geloescht. "
+                       "WLAN und Strom-Nullpunkt-Kalibrierung bleiben erhalten. "
+                       "Der Server kann seine Konfiguration beim naechsten Heartbeat erneut senden.");
+    lv_obj_t *cancel_button = lv_msgbox_add_footer_button(message_box, "Abbrechen");
+    lv_obj_t *reset_button = lv_msgbox_add_footer_button(message_box, "Zuruecksetzen");
+    lv_obj_add_event_cb(cancel_button, bridge_reset_cancel_cb, LV_EVENT_CLICKED, message_box);
+    lv_obj_add_event_cb(reset_button, bridge_reset_confirm_cb, LV_EVENT_CLICKED, message_box);
+}
+
 /* Button "Konfiguration abrufen": Heartbeat sofort einreihen statt auf das Intervall zu warten.
  * Der Heartbeat liefert eine wartende Wunsch-Konfiguration aus (parse_bridge_config_from_response)
  * und loest bei Bedarf den Konfigurations-Upload aus; danach werden auch die Buchungen geholt. */
@@ -4200,7 +4529,7 @@ static void heartbeat_timer_cb(lv_timer_t *timer)
     }
 
     int64_t now_us = esp_timer_get_time();
-    int64_t interval_ms = bridge_cfg_is_configured(&s_bridge_cfg) ? HEARTBEAT_INTERVAL_MS : HEARTBEAT_INTERVAL_UNCONFIGURED_MS;
+    int64_t interval_ms = (bridge_cfg_is_configured(&s_bridge_cfg) && !s_server_offline) ? HEARTBEAT_INTERVAL_MS : HEARTBEAT_INTERVAL_UNCONFIGURED_MS;
     if ((s_last_heartbeat_us != 0) && ((now_us - s_last_heartbeat_us) < (interval_ms * 1000)))
     {
         return;
@@ -4374,12 +4703,23 @@ static void activate_unlock(uint32_t server_duration_min)
     {
         dur = 30;
     }
-    s_unlock_duration_orig_min = dur;
-    s_unlock_until_us = esp_timer_get_time() + (int64_t)dur * 60 * 1000000;
-    ESP_LOGI(TAG, "Unlock activated for %lu min", (unsigned long)dur);
+    activate_unlock_for_ms((uint64_t)dur * 60000ULL);
+}
+
+static bool activate_unlock_for_ms(uint64_t duration_ms)
+{
+    if ((duration_ms == 0) || (duration_ms > (uint64_t)INT64_MAX / 1000ULL))
+    {
+        ESP_LOGE(TAG, "Invalid unlock duration: %llu ms", (unsigned long long)duration_ms);
+        return false;
+    }
+    s_unlock_duration_orig_ms = duration_ms;
+    s_unlock_until_us = esp_timer_get_time() + (int64_t)(duration_ms * 1000ULL);
+    ESP_LOGI(TAG, "Unlock activated for %llu ms", (unsigned long long)duration_ms);
 
     /* Force immediate heartbeat so server sees the unlock status right away */
     s_last_heartbeat_us = 0;
+    return true;
 }
 
 /* Tap auf Statusindikator → Unlock-Timer zurücksetzen */
@@ -4389,13 +4729,13 @@ static void unlock_indicator_click_cb(lv_event_t *event)
     if (s_unlock_until_us > 0)
     {
         /* Reset timer to original duration */
-        uint32_t dur = s_unlock_duration_orig_min;
-        if (dur == 0)
+        uint64_t dur_ms = s_unlock_duration_orig_ms;
+        if (dur_ms == 0)
         {
-            dur = 30;
+            dur_ms = 30ULL * 60000ULL;
         }
-        s_unlock_until_us = esp_timer_get_time() + (int64_t)dur * 60 * 1000000;
-        ESP_LOGI(TAG, "Unlock timer reset to %lu min", (unsigned long)dur);
+        s_unlock_until_us = esp_timer_get_time() + (int64_t)(dur_ms * 1000ULL);
+        ESP_LOGI(TAG, "Unlock timer reset to %llu ms", (unsigned long long)dur_ms);
     }
 }
 
@@ -4786,6 +5126,28 @@ static void measure_idle_current_event_cb(lv_event_t *event)
  *      Karten-Registrierungs-Button
  * Plus: Login-Modal, WLAN-Konfigurationsmodal, Debug-Overlay, Keyboard
  * ════════════════════════════════════════════════════════════════════════════ */
+
+/* Offline-Rahmen ein-/ausblenden */
+static void offline_frame_timer_cb(lv_timer_t *timer)
+{
+    LV_UNUSED(timer);
+    if (s_ui.offline_frame == NULL)
+    {
+        return;
+    }
+    const bool hidden = lv_obj_has_flag(s_ui.offline_frame, LV_OBJ_FLAG_HIDDEN);
+    if (bridge_is_offline() == hidden)
+    {
+        if (hidden)
+        {
+            lv_obj_clear_flag(s_ui.offline_frame, LV_OBJ_FLAG_HIDDEN);
+        }
+        else
+        {
+            lv_obj_add_flag(s_ui.offline_frame, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
 
 static void create_ui(void)
 {
@@ -5531,6 +5893,10 @@ static void create_ui(void)
     lv_obj_t *bridge_sync_btn = create_primary_button(s_ui.status_tab_bridge, "Konfiguration abrufen");
     lv_obj_add_event_cb(bridge_sync_btn, bridge_sync_btn_cb, LV_EVENT_CLICKED, NULL);
 
+    lv_obj_t *bridge_reset_btn = create_primary_button(s_ui.status_tab_bridge, "Bridge-Konfiguration zuruecksetzen");
+    lv_obj_set_style_bg_color(bridge_reset_btn, lv_color_hex(0x991B1B), 0);
+    lv_obj_add_event_cb(bridge_reset_btn, bridge_reset_btn_cb, LV_EVENT_CLICKED, NULL);
+
     /* --- System sub-tab --- */
     /* --- Kalibrierung/Messung sub-tab --- */
     s_ui.status_tab_cal = lv_obj_create(tab_scroll_area);
@@ -5647,6 +6013,17 @@ static void create_ui(void)
     lv_obj_align(s_debug_label, LV_ALIGN_BOTTOM_LEFT, 8, -10);
     lv_obj_add_flag(s_debug_label, LV_OBJ_FLAG_HIDDEN);
     lv_timer_create(debug_overlay_timer_cb, 1000, NULL);
+
+    /* Oranger Rahmen über allen Ansichten (layer_top), solange die Bridge offline ist */
+    s_ui.offline_frame = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_ui.offline_frame, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_opa(s_ui.offline_frame, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(s_ui.offline_frame, 0, 0);
+    lv_obj_set_style_border_color(s_ui.offline_frame, lv_color_hex(0xF97316), 0);
+    lv_obj_set_style_border_width(s_ui.offline_frame, 6, 0);
+    lv_obj_clear_flag(s_ui.offline_frame, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_ui.offline_frame, LV_OBJ_FLAG_HIDDEN);
+    lv_timer_create(offline_frame_timer_cb, 1000, NULL);
 }
 
 #if ENABLE_NFC
@@ -6287,6 +6664,7 @@ static void nfc_task(void *arg)
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "PN532 init endgueltig fehlgeschlagen: %s", esp_err_to_name(err));
+        bridge_set_error("PN532 Init fehlgeschlagen: %s", esp_err_to_name(err));
         set_status_text("NFC Fehler", lv_color_hex(0xFCA5A5));
         vTaskDelete(NULL);
         return;
@@ -6307,17 +6685,6 @@ static void nfc_task(void *arg)
         {
             last_uid_text[0] = '\0';
             s_reset_nfc_uid_requested = false;
-        }
-
-        if (s_auth_busy && (s_auth_busy_since_us > 0))
-        {
-            int64_t busy_ms = (esp_timer_get_time() - s_auth_busy_since_us) / 1000;
-            if (busy_ms > AUTH_BUSY_TIMEOUT_MS)
-            {
-                ESP_LOGW(TAG, "Auth busy timeout (%lld ms), force clear", (long long)busy_ms);
-                set_auth_busy(false);
-                set_status_text("Server Timeout, erneut versuchen", lv_color_hex(0xFCA5A5));
-            }
         }
 
         /* s_auth_busy NICHT hier prüfen: ein Heartbeat (v.a. gegen einen langsamen/nicht
@@ -6350,6 +6717,7 @@ static void nfc_task(void *arg)
                 if (recover_err != ESP_OK)
                 {
                     ESP_LOGE(TAG, "PN532 recovery failed: %s", esp_err_to_name(recover_err));
+                    bridge_set_error("PN532 Recovery fehlgeschlagen: %s", esp_err_to_name(recover_err));
                     set_status_text("NFC Fehler", lv_color_hex(0xFCA5A5));
                 }
                 else
@@ -6426,29 +6794,16 @@ static void nfc_task(void *arg)
             req.value_a[j] = '\0';
         }
 
-        /* SuperUser-Check: direkte lokale Freischaltung ohne Server-Abfrage */
-        if (!s_register_card_mode && s_bridge_cfg.superuser_count > 0)
+        /* Offline (Heartbeat-Timeout/kein WLAN): SuperUser-Karte schaltet lokal frei.
+         * Online läuft sie über /activations mit dem konfigurierten Scope. */
+        if (!s_register_card_mode && bridge_is_offline() && bridge_find_superuser(req.value_a, NULL))
         {
-            bool is_superuser = false;
-            for (int su = 0; su < s_bridge_cfg.superuser_count; su++)
-            {
-                if (s_bridge_cfg.superuser_uids[su][0] != '\0' &&
-                    strcasecmp(req.value_a, s_bridge_cfg.superuser_uids[su]) == 0)
-                {
-                    is_superuser = true;
-                    break;
-                }
-            }
-            if (is_superuser)
-            {
-                ESP_LOGI(TAG, "SuperUser UID erkannt: %s – sofortige Freischaltung", req.value_a);
-                set_status_text("SuperUser - Zugang gewährt", lv_color_hex(0x86EFAC));
-                activate_unlock(s_bridge_cfg.unlock_duration_min > 0 ? s_bridge_cfg.unlock_duration_min : 30);
-                vTaskDelay(pdMS_TO_TICKS(NFC_POLL_AFTER_CARD_MS));
-                continue;
-            }
+            ESP_LOGI(TAG, "SuperUser UID erkannt: %s – Offline-Freischaltung", req.value_a);
+            set_status_text("SuperUser (offline) - Zugang gewährt", lv_color_hex(0x86EFAC));
+            activate_unlock(s_bridge_cfg.unlock_duration_min > 0 ? s_bridge_cfg.unlock_duration_min : 30);
+            vTaskDelay(pdMS_TO_TICKS(NFC_POLL_AFTER_CARD_MS));
+            continue;
         }
-
         if (enqueue_auth_request(&req))
         {
             set_auth_busy(true);
@@ -6524,6 +6879,7 @@ void app_main(void)
     ESP_ERROR_CHECK(wifi_cfg_load(&s_wifi_cfg));
     ESP_ERROR_CHECK(auth_cfg_load(&s_auth_cfg));
     ESP_ERROR_CHECK(bridge_cfg_load(&s_bridge_cfg));
+    bridge_log_superusers("Konfiguration geladen");
     /* Gespeicherten Messwert nach Neustart wiederherstellen */
     if (s_bridge_cfg.idle_current > 0.0f)
     {
@@ -6617,10 +6973,11 @@ void app_main(void)
 
     /* 12288 statt 8192: eigene Buffer (payload[512]+response[1024]) plus esp_http_client/LWIP-
      * interner Stackbedarf beim HTTPS-POST fuehrten mit 8192 zu einem Stack-Overflow. */
-    BaseType_t auth_task_ok = xTaskCreatePinnedToCore(auth_worker_task, "auth_worker", 12288, NULL, 5, NULL, AUTH_TASK_CORE_ID);
+    BaseType_t auth_task_ok = xTaskCreatePinnedToCore(auth_worker_task, "auth_worker", 16384, NULL, 5, NULL, AUTH_TASK_CORE_ID);
     if (auth_task_ok != pdPASS)
     {
         ESP_LOGE(TAG, "Auth worker start failed");
+        bridge_set_error("Auth-Worker Start fehlgeschlagen");
     }
 
     /* Kontinuierliche Strommessung (MCS1806 an ADS1115 AIN0) */
@@ -6634,6 +6991,7 @@ void app_main(void)
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "WiFi init failed: %s", esp_err_to_name(err));
+        bridge_set_error("WLAN-Init fehlgeschlagen: %s", esp_err_to_name(err));
         set_status_text("WLAN Init Fehler", lv_color_hex(0xFCA5A5));
     }
 
@@ -6642,6 +7000,7 @@ void app_main(void)
     if (nfc_task_ok != pdPASS)
     {
         ESP_LOGE(TAG, "NFC task start failed");
+        bridge_set_error("NFC-Task Start fehlgeschlagen");
     }
 #endif
 }

@@ -8,7 +8,7 @@ Firmware für das **LiMa (Lernen im Makerspace) Bridge**-Gerät, das auf einem *
 
 ### Authentifizierung
 - **NFC-Karte / Button**: PN532-Reader (I2C, Adresse 0x54) liest die UID, oder der Start-Button löst die Authentifizierung über die MAC-Adresse aus
-- **SuperUser**: Bis zu 32 NFC-UIDs können serverseitig als SuperUser hinterlegt werden – diese schalten die Maschine direkt ohne Netzwerk-Roundtrip frei
+- **SuperUser**: Bis zu 64 Mitarbeiterkarten (Array `superuser`, je `card` mit Scopes `login`/`booking`/`instructions`) können serverseitig hinterlegt werden – sie schaltet die Maschine offline direkt frei und sendet online den Scope an `/activations`
 - **Activation-Flow**: Karte/Button → Gerät fragt `POST /activations` mit `card_id`, `device_id` und **`resource_id`** an → Server liefert eine Freigabe-URL (+ Ablaufzeit) → Bridge zeigt QR-Code/URL an, Nutzer meldet sich im Browser an (Microsoft Entra ID) → Bridge pollt `GET /activations/decision/<code>` alle 1,5 s bis Freigabe (200), Ablehnung (403) oder Ablauf (404)
 - **Karten-Registrierung**: Weiterhin im Code vorhanden, aber vom Start-Button aus aktuell nicht mehr erreichbar (siehe unten)
 
@@ -25,7 +25,7 @@ Firmware für das **LiMa (Lernen im Makerspace) Bridge**-Gerät, das auf einem *
 - **Server-Endpunkte** (`AUTH_URL_*`): HTTPS zu `lima.intern.hs-duesseldorf.de`, authentifiziert per festem Bearer-Token (`BRIDGE_API_TOKEN`) – siehe [Server-API](#server-api)
 - **OTA-Endpunkte** (`OTA_URL_CHECK`/`OTA_URL_FIRMWARE`) weiterhin HTTPS zu `lima.hsd.pub` mit Let's-Encrypt-Zertifikat
 - Periodischer Heartbeat (5 Min. konfiguriert / 1 Min. unkonfiguriert)
-- Bridge-Konfiguration (Name, Standort, Info-URL, **Anny-Ressourcen-ID**, Idle-Strom, OTP-Pflicht, SuperUser-UIDs usw.) wird vom Server synchronisiert (Config-Hash als `config_version`)
+- Bridge-Konfiguration (Name, Standort, Info-URL, **Anny-Ressourcen-ID**, Idle-Strom, OTP-Pflicht, SuperUser-Karte usw.) wird vom Server synchronisiert (Config-Hash als `config_version`)
 - Button **„Konfiguration abrufen"** im Bridge-Tab stößt sofort einen Heartbeat an (liefert wartende Konfiguration bzw. löst den Voll-Upload aus), ohne das Intervall abzuwarten
 - Nach jedem erfolgreichen Heartbeat holt die Bridge die Buchungen der Ressource über `GET /bookings/{Ressourcen-ID}`; die laufende bzw. nächste Buchung erscheint als Banner auf der Startseite (rechts neben dem QR-Code, unter „NFC UID:"). Voraussetzung: gesetzte `resource_id` und SNTP-Sync
 - WLAN-Modem-Sleep ist abgeschaltet (`WIFI_PS_NONE`), damit der TLS-Handshake nicht durch Beacon-Wartezeiten ausgebremst wird
@@ -117,8 +117,8 @@ Die `resource_id` ist die Anny-ID der Ressource und wird im Dashboard pro Bridge
 
 ### Datenfluss (Authentifizierung)
 1. NFC-Karte erkannt (oder Start-Button gedrückt) → `auth_request_t` (UID bzw. MAC) in Request-Queue
-2. Auth-Worker prüft zuerst lokal gegen `superuser_uids` – direktes Unlock ohne Server möglich
-3. Sonst POST an `/activations` (`card_id`/`device_id`/`resource_id`)
+2. Ist die Karte eine der konfigurierten `superuser`-Karten und der Server offline (Heartbeat-Timeout/kein WLAN), schaltet die Bridge lokal frei
+3. Sonst POST an `/activations` (`card_id`/`device_id`/`resource_id`; bei der SuperUser-Karte zusätzlich `scope` aus `login`/`booking`/`instructions`)
 4. Server antwortet mit einer Freigabe-`url` (+ optional `expiresAt`)
 5. Bridge zeigt Activation-Overlay (QR-Code + URL) und startet `activation_poll_timer_cb` (alle 1,5 s)
 6. Polling gegen `/activations/decision/<code>`:
@@ -156,7 +156,6 @@ Die `resource_id` ist die Anny-ID der Ressource und wird im Dashboard pro Bridge
 | `CURRENT_RMS_SAMPLES` | `128` | Samples pro RMS-Berechnung (kontinuierliche Strommessung) |
 | `MCS1806_SENSITIVITY_MV_A` | `66.0` | Empfindlichkeit Stromsensor [mV/A] |
 | `MCS1806_OFFSET_MV` | `1650.0` | Ruhespannung Stromsensor bei 0A [mV] |
-| `SUPERUSER_MAX` | `32` | Max. SuperUser-UIDs pro Bridge |
 | `PN532_I2C_ADDR` | `0x54` | I2C-Adresse des PN532 |
 
 ### NVS-Namespaces
@@ -164,7 +163,7 @@ Die `resource_id` ist die Anny-ID der Ressource und wird im Dashboard pro Bridge
 |-----------|---------|--------|
 | `wifi_cfg` | 2 | SSID, Passwort, IP-Konfiguration, EAP |
 | `auth_cfg` | 1 | Server-Token, MAC-Adresse |
-| `bridge_cfg` | 8 | Maschinenname, Standort, Info-URL, Ressourcen-ID, Idle-Strom, SuperUser-UIDs, Config-Hash, Idle-Shutdown-Delay (Versionswechsel verwirft die gespeicherte Konfiguration, sie kommt per Heartbeat neu) |
+| `bridge_cfg` | 10 | Maschinenname, Standort, Info-URL, Ressourcen-ID, Idle-Strom, SuperUser (max. 64 Karten + Scopes), Config-Hash, Idle-Shutdown-Delay (Versionswechsel verwirft die gespeicherte Konfiguration, sie kommt per Heartbeat neu) |
 | `bridge_cfg` / `zero_cal_mv` | – | Kalibrierter Nullpunkt des Stromsensors [mV] (versionierungsunabhängig) |
 
 ## Bekannte Probleme / Work in Progress
